@@ -1,0 +1,42 @@
+{
+  "date": "2026-10-16T00:00:48",
+  "model": "qwen2.5-0.5b",
+  "device": "mps",
+  "requests": 16,
+  "max_tokens": 48,
+  "runs": [
+    {
+      "max_batch": 1,
+      "wall_s": 73.6,
+      "output_tokens": 768,
+      "throughput_tok_s": 10.43,
+      "mean_latency_s": 38.77,
+      "p50_ttft_s": 34.032,
+      "engine_steps": 768,
+      "preemptions": 0,
+      "speedup_vs_batch1": 1.0
+    },
+    {
+      "max_batch": 4,
+      "wall_s": 32.98,
+      "output_tokens": 768,
+      "throughput_tok_s": 23.29,
+      "mean_latency_s": 21.33,
+      "p50_ttft_s": 13.732,
+      "engine_steps": 192,
+      "preemptions": 0,
+      "speedup_vs_batch1": 2.23
+    },
+    {
+      "max_batch": 16,
+      "wall_s": 19.69,
+      "output_tokens": 768,
+      "throughput_tok_s": 39.0,
+      "mean_latency_s": 19.18,
+      "p50_ttft_s": 0.845,
+      "engine_steps": 49,
+      "preemptions": 0,
+      "speedup_vs_batch1": 3.74
+    }
+  ]
+}
