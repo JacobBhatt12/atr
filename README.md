@@ -754,12 +754,12 @@ Each month ends with something that runs and a number you can measure.
 
 **Month 1: Baseline and API**
 - [x] Project folder, README, starter code
-- [ ] Run Qwen 2.5 0.5B with our own sampling loop (`engine/naive_engine.py`)
-- [ ] OpenAI-compatible FastAPI server with streaming (`gateway/server.py`)
-- [ ] Benchmark harness: time to first token, tokens/sec, latency percentiles
-- [ ] Load test with 1, 8, 32 users and record how badly the naive engine does
+- [x] Run Qwen 2.5 0.5B with our own sampling loop (`engine/naive_engine.py`)
+- [x] OpenAI-compatible FastAPI server with streaming (`gateway/server.py`)
+- [x] Benchmark harness: time to first token, tokens/sec, latency percentiles
+- [x] Load test with 1, 8, 32 users and record how badly the naive engine does
 - [x] Push to GitHub, set up GitHub Actions running pytest
-- **Milestone number:** baseline tokens/sec on a T4
+- **Milestone number:** baseline tokens/sec on a T4: **35.3 tok/s** (Hugging Face `model.generate`, one request at a time, fp16)
 
 **Month 2: Continuous batching and paged KV cache**
 - [x] Write our own model forward pass (embedding, RMSNorm, RoPE, attention, MLP) using HF weights
