@@ -99,7 +99,7 @@ class LLMEngine:
             return []
         self.total_steps += 1
 
-        ids, positions, seq_meta, write_slots, logits_rows, to_sample = [], [], [], [], [], []
+        ids, positions, meta, ctx_list, write_slots, logits_rows, to_sample = [], [], [], [], [], [], []
         offset = 0
         for seq, n in batch:
             start, end = seq.num_computed, seq.num_computed + n
@@ -107,18 +107,25 @@ class LLMEngine:
             positions.extend(range(start, end))
             ctx_slots = self.cache.slots(seq.block_table, 0, end)
             write_slots.append(ctx_slots[start:end])
-            seq_meta.append((offset, n, end, ctx_slots))
+            ctx_list.append(ctx_slots)
+            meta.append((offset, n, end))
             if end == seq.length:  # reached the newest token: we owe this sequence a new token
                 logits_rows.append(offset + n - 1)
                 to_sample.append(seq)
             offset += n
 
+        # Send every sequence's slot list to the GPU in ONE copy. Otherwise attention would
+        # index the GPU cache with CPU tensors, a hidden copy per sequence per layer.
+        device = self.model.device
+        ctx_dev = torch.cat(ctx_list).to(device).split([len(c) for c in ctx_list])
+        seq_meta = [(o, n, end, c) for (o, n, end), c in zip(meta, ctx_dev)]
+
         logits = self.model.forward(
-            torch.tensor(ids, device=self.model.device),
-            torch.tensor(positions, device=self.model.device),
+            torch.tensor(ids, device=device),
+            torch.tensor(positions, device=device),
             seq_meta,
-            torch.cat(write_slots).to(self.model.device),
-            torch.tensor(logits_rows, dtype=torch.long, device=self.model.device),
+            torch.cat(write_slots).to(device),
+            torch.tensor(logits_rows, dtype=torch.long, device=device),
             self.cache,
         )
         for seq, n in batch:
