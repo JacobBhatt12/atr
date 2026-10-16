@@ -1,4 +1,4 @@
-"""Month 2 headline benchmark: continuous batching ON vs OFF.
+"""Continuous batching ON vs OFF (Month 2 headline; rerun with --kernels for Month 3).
 
 Same engine, same model, same prompts. The only change is how many sequences
 may share a forward pass. Batch size 1 is how the Month 1 server behaved.
@@ -89,11 +89,15 @@ def main():
     ap.add_argument("--batches", default="1,4,16")
     ap.add_argument("--kv-cache-mb", type=int, default=256, help="KV cache budget in MB")
     ap.add_argument("--hf-baseline", action="store_true", help="also time plain HF model.generate, one request at a time")
+    ap.add_argument("--kernels", default="auto", help="'auto' (Triton on CUDA), 'none' (PyTorch ops), or e.g. attention,norm")
+    ap.add_argument("--quant", type=int, choices=[8, 4], default=None, help="int8 / int4 weights")
     args = ap.parse_args()
 
     device = pick_device()
     dtype = torch.float16 if device == "cuda" else torch.float32
-    engine = LLMEngine.from_pretrained(args.model, device=device, dtype=dtype, kv_cache_mb=args.kv_cache_mb)
+    kernels = None if args.kernels == "auto" else () if args.kernels == "none" else tuple(args.kernels.split(","))
+    engine = LLMEngine.from_pretrained(args.model, device=device, dtype=dtype, kv_cache_mb=args.kv_cache_mb,
+                                       kernels=kernels, quant_bits=args.quant)
     tok = engine.tokenizer
     prompts = []
     for i in range(args.requests):
@@ -101,7 +105,8 @@ def main():
         prompts.append(tok(tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)).input_ids)
 
     print(f"model={Path(args.model).name} device={device} params={engine.model.num_params()/1e6:.0f}M "
-          f"dtype={str(dtype).split('.')[-1]} kv_blocks={engine.cache.num_blocks} requests={args.requests} max_tokens={args.max_tokens}")
+          f"dtype={str(dtype).split('.')[-1]} kv_blocks={engine.cache.num_blocks} requests={args.requests} max_tokens={args.max_tokens} "
+          f"kernels={','.join(sorted(engine.model.kernels)) or 'pytorch'} quant={args.quant}")
     engine.generate(prompts[:1], SamplingParams(max_tokens=4, temperature=0.0))  # warm up
 
     results = []
@@ -130,6 +135,7 @@ def main():
     report = {"date": datetime.now().isoformat(timespec="seconds"), "model": Path(args.model).name,
               "device": device, "dtype": str(dtype).split(".")[-1], "gpu": torch.cuda.get_device_name() if device == "cuda" else None,
               "requests": args.requests, "max_tokens": args.max_tokens, "kv_cache_mb": args.kv_cache_mb,
+              "kernels": sorted(engine.model.kernels), "quant": args.quant,
               "runs": results, "hf_baseline": hf}
     path = out_dir / f"batching_{device}_{datetime.now():%Y%m%d_%H%M%S}.json"
     path.write_text(json.dumps(report, indent=2))

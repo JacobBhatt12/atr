@@ -1,0 +1,72 @@
+{
+  "date": "2026-10-16T16:42:26",
+  "device": "mps",
+  "gpu": null,
+  "model": "qwen2.5-0.5b",
+  "dtype": "float32",
+  "eval_text": "README.md",
+  "ppl_tokens": 1024,
+  "window": 512,
+  "rows": [
+    {
+      "config": "float32",
+      "bits": 32,
+      "group_size": null,
+      "perplexity": 14.103,
+      "linear_weight_mb": 1365.0,
+      "total_weight_mb": 1884.6,
+      "batch_1_tok_s": 24.46,
+      "batch_4_tok_s": 73.84,
+      "linear_memory_saved_pct": 0.0,
+      "ppl_increase_pct": 0.0
+    },
+    {
+      "config": "int8",
+      "bits": 8,
+      "group_size": 128,
+      "perplexity": 14.115,
+      "linear_weight_mb": 351.9,
+      "total_weight_mb": 871.5,
+      "batch_1_tok_s": 4.7,
+      "batch_4_tok_s": 18.53,
+      "linear_memory_saved_pct": 74.2,
+      "ppl_increase_pct": 0.09
+    },
+    {
+      "config": "int4",
+      "bits": 4,
+      "group_size": 128,
+      "perplexity": 19.256,
+      "linear_weight_mb": 181.3,
+      "total_weight_mb": 700.9,
+      "batch_1_tok_s": 3.65,
+      "batch_4_tok_s": 12.5,
+      "linear_memory_saved_pct": 86.7,
+      "ppl_increase_pct": 36.54
+    },
+    {
+      "config": "int4g64",
+      "bits": 4,
+      "group_size": 64,
+      "perplexity": 16.987,
+      "linear_weight_mb": 192.0,
+      "total_weight_mb": 711.5,
+      "batch_1_tok_s": 3.35,
+      "batch_4_tok_s": 9.09,
+      "linear_memory_saved_pct": 85.9,
+      "ppl_increase_pct": 20.45
+    },
+    {
+      "config": "int4g32",
+      "bits": 4,
+      "group_size": 32,
+      "perplexity": 16.353,
+      "linear_weight_mb": 213.3,
+      "total_weight_mb": 732.9,
+      "batch_1_tok_s": 3.03,
+      "batch_4_tok_s": 9.17,
+      "linear_memory_saved_pct": 84.4,
+      "ppl_increase_pct": 15.95
+    }
+  ]
+}

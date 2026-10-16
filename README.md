@@ -716,16 +716,20 @@ VRTX/
 ├── requirements.txt
 ├── .gitignore
 ├── engine/                 VRTX Engine
-│   ├── sampling.py         temperature / top-k / top-p (done)
-│   ├── naive_engine.py     Month 1 baseline engine (done)
-│   ├── scheduler.py        continuous batching (Month 2)
-│   ├── kv_cache.py         paged KV blocks + prefix cache (Month 2)
-│   ├── model_runner.py     our own forward pass (Month 2-3)
-│   ├── kernels/            Triton kernels (Month 3)
-│   ├── quant/              int8 / int4 (Month 3)
-│   └── speculative/        draft + verify (Month 4)
+│   ├── sampling.py         temperature / top-k / top-p, batched (Month 1-2)
+│   ├── naive_engine.py     Month 1 baseline engine
+│   ├── model.py            our own forward pass; picks PyTorch or Triton per op (Month 2-3)
+│   ├── ops.py              PyTorch reference ops, incl. batched paged decode attention
+│   ├── batch.py            flat ragged batch + attention metadata for one step
+│   ├── scheduler.py        continuous batching, chunked prefill, recompute/swap preemption
+│   ├── kv_cache.py         paged KV blocks, prefix-cache hashing, copy-on-write, swap (Month 2-4)
+│   ├── llm_engine.py       the engine loop: schedule -> (draft) -> forward -> sample/verify
+│   ├── async_engine.py     background thread for the server
+│   ├── kernels/            Triton: RMSNorm, RoPE+cache, SiLU, paged attention, int8/int4 matmul (Month 3)
+│   ├── quant/              int8 / int4 group quantization (Month 3)
+│   └── speculative/        draft proposals, exact verify rule, adaptive gamma (Month 4)
 ├── gateway/                FastAPI front door
-│   └── server.py           OpenAI-compatible API (done, Month 1)
+│   └── server.py           OpenAI-compatible API
 ├── cloud/                  VRTX Cloud
 │   ├── raft/               consensus (Month 6)
 │   ├── api/                control plane REST API (Month 5)
@@ -738,10 +742,18 @@ VRTX/
 ├── cli/                    `vrtx` command (Month 5+)
 ├── dashboard/              Next.js web UI (Month 8)
 ├── benchmarks/
-│   └── bench_naive.py      Month 1 baseline numbers (done)
+│   ├── bench_naive.py      Month 1 baseline
+│   ├── bench_batching.py   throughput vs batch size (Month 2; --kernels / --quant for Month 3)
+│   ├── bench_kernels.py    each Triton kernel vs PyTorch + roofline data + ablation (Month 3)
+│   ├── bench_quant.py      perplexity vs memory vs speed (Month 3)
+│   ├── bench_prefix.py     shared system prompt, prefix caching on/off (Month 4)
+│   ├── bench_spec.py       speculative decoding speedup vs gamma (Month 4)
+│   ├── bench_serving.py    full workloads on VRTX, vLLM, naive HF (Month 4)
+│   ├── plots.py            every writeup chart -> docs/charts/
+│   └── results/            raw JSON from every run
 ├── tests/
 ├── docs/                   design notes, math derivations, blog drafts
-└── scripts/                setup helpers
+└── scripts/                kaggle_benchmark.ipynb: one Run All for every GPU number
 ```
 
 ---
@@ -765,8 +777,9 @@ Each month ends with something that runs and a number you can measure.
 - [x] Write our own model forward pass (embedding, RMSNorm, RoPE, attention, MLP) using HF weights
 - [x] Block allocator and block tables
 - [x] Iteration-level scheduler with chunked prefill
-- [x] Preemption: recompute (swap to CPU still to do)
+- [x] Preemption: recompute, and swap to CPU (`preemption_mode="swap"`, falls back to recompute when swap space is full)
 - [x] T4 benchmark vs. batch 1 and naive Hugging Face
+- [x] Batched decode attention: one padded gather + two matmuls for every decode sequence, replacing the per-sequence loop
 - **Milestone number:** throughput at 32 users vs. Month 1 (target 5x or more)
 
 **Month 2 results (Kaggle Tesla T4, fp16, Qwen2.5-0.5B-Instruct, 64 requests x 128 output tokens, 256 MB KV cache)**
@@ -785,18 +798,31 @@ Milestone status: 3.6x at 32 users, short of the 5x target. The reason is visibl
 
 Other runs: 4-core Linux CPU, 8 users: 3.1 to 18.2 tok/s (5.8x). Apple M4 GPU (mps, fp32), 16 users: 10.4 to 39.0 tok/s (3.7x). Raw JSON in `benchmarks/results/`.
 
+**Fix for the bottleneck above.** Decode attention is now one batched operation for all decode sequences (padded gather of every sequence's pages, masked, grouped-query matmuls), and sampling is one call per group of settings instead of one GPU sync per sequence. Same Apple M4 run, 16 users: **24.0 to 182.3 tok/s (7.6x over batch 1, 4.7x the old batch-16 number)**. The T4 rerun is cell 3 of `scripts/kaggle_benchmark.ipynb`.
+
 **Month 3: Kernels and quantization**
-- [ ] Triton: fused RMSNorm, RoPE, flash-style prefill attention, paged decode attention
-- [ ] Int8 and int4 weight quantization with group scales
-- [ ] Perplexity vs. memory chart, roofline chart
-- **Milestone number:** kernel speedups vs. PyTorch, memory saved
+- [x] Triton: fused add + RMSNorm, fused RoPE + KV-cache write, fused SiLU*up (`engine/kernels/`)
+- [x] Triton: paged decode attention (one program per sequence per KV head, GQA-aware, online softmax)
+- [x] Triton: flash-style paged prefill attention (causal, ragged batch, skips masked tiles)
+- [x] Int8 and int4 weight quantization with group scales; Triton matmul that dequantizes in registers
+- [x] Tests: every kernel vs. its PyTorch twin (CI runs them in Triton's CPU interpreter)
+- [x] Perplexity vs. memory chart, roofline chart (`benchmarks/plots.py`)
+- [ ] Run on the T4 (`scripts/kaggle_benchmark.ipynb`) and record the numbers here
+- **Milestone number:** kernel speedups vs. PyTorch, memory saved: *pending T4 run*
+
+Measured so far (Apple M4, fp32, PyTorch dequant path, README text, 1K tokens): perplexity 14.10 base, 14.12 int8 (matmul weights 1365 MB to 352 MB, -74%), 16.35 int4 group 32 (213 MB, -84%), 19.26 int4 group 128 (181 MB). int4 needs small groups on a 0.5B model. On the Mac the quantized model is ~5x *slower*, because the PyTorch fallback rebuilds each fp32 weight on every call; the speed win depends on the Triton kernel, so it can only be measured on the T4.
 
 **Month 4: Speculative decoding and prefix caching**
-- [ ] Draft/target verification with the exact rejection rule
-- [ ] Adaptive gamma
-- [ ] Prefix hashing, reference counts, copy-on-write
-- [ ] Full benchmark writeup vs. HF naive and vLLM
-- **Milestone number:** headline tokens/sec and concurrent users
+- [x] Draft/target verification with the exact rejection rule (draft shares the target's block tables)
+- [x] Adaptive gamma: per-sequence acceptance estimate + live draft/target cost ratio, backs off to plain decoding
+- [x] Prefix hashing, reference counts, LRU eviction of cached blocks, copy-on-write
+- [x] Benchmarks: prefix caching on/off, speedup vs. gamma, full serving workloads on VRTX / vLLM / HF
+- [ ] Run on the T4 and write up vs. HF naive and vLLM
+- **Milestone number:** headline tokens/sec and concurrent users: *pending T4 run*
+
+Measured so far (Apple M4): shared 256-token system prompt, 8 requests: 70% prefix hit rate, 2.0x throughput, median TTFT 0.98 s to 0.54 s. Greedy speculative output is token-for-token identical to the target alone (tested).
+
+Known limit: prefix caching and speculative decoding can't be on at the same time yet (the draft cache would need its own prefix bookkeeping).
 
 ### Phase 2: VRTX Cloud and Ops (Months 5 to 8)
 
@@ -959,7 +985,16 @@ curl -N http://localhost:8000/v1/chat/completions \
 
 # 5. Get your first baseline number
 python -m benchmarks.bench_naive
+
+# 6. Months 2-4 (all work on a Mac; the Triton kernels switch on automatically on CUDA)
+python -m pytest tests/ -q
+python -m benchmarks.bench_batching                  # continuous batching
+python -m benchmarks.bench_quant                     # int8 / int4 perplexity vs memory
+python -m benchmarks.bench_prefix                    # prefix caching on/off
+VRTX_QUANT=8 uvicorn gateway.server:app --port 8000  # serve int8 weights
 ```
+
+GPU numbers: open `scripts/kaggle_benchmark.ipynb` on Kaggle (GPU T4, internet on), Run All, then `python -m benchmarks.plots` on the downloaded results.
 
 Then:
 
