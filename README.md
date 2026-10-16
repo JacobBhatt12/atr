@@ -758,15 +758,32 @@ Each month ends with something that runs and a number you can measure.
 - [ ] OpenAI-compatible FastAPI server with streaming (`gateway/server.py`)
 - [ ] Benchmark harness: time to first token, tokens/sec, latency percentiles
 - [ ] Load test with 1, 8, 32 users and record how badly the naive engine does
-- [ ] Push to GitHub, set up GitHub Actions running pytest
+- [x] Push to GitHub, set up GitHub Actions running pytest
 - **Milestone number:** baseline tokens/sec on a T4
 
 **Month 2: Continuous batching and paged KV cache**
-- [ ] Write our own model forward pass (embedding, RMSNorm, RoPE, attention, MLP) using HF weights
-- [ ] Block allocator and block tables
-- [ ] Iteration-level scheduler with chunked prefill
-- [ ] Preemption: swap or recompute
+- [x] Write our own model forward pass (embedding, RMSNorm, RoPE, attention, MLP) using HF weights
+- [x] Block allocator and block tables
+- [x] Iteration-level scheduler with chunked prefill
+- [x] Preemption: recompute (swap to CPU still to do)
+- [x] T4 benchmark vs. batch 1 and naive Hugging Face
 - **Milestone number:** throughput at 32 users vs. Month 1 (target 5x or more)
+
+**Month 2 results (Kaggle Tesla T4, fp16, Qwen2.5-0.5B-Instruct, 64 requests x 128 output tokens, 256 MB KV cache)**
+
+| Setup | Throughput | vs. batch 1 | vs. naive HF | Wall time | Engine steps |
+|---|---|---|---|---|---|
+| Hugging Face `model.generate`, one request at a time | 35.3 tok/s | | 1.00x | 232.1 s | |
+| VRTX, max batch 1 | 40.8 tok/s | 1.00x | 1.16x | 200.8 s | 8192 |
+| VRTX, max batch 8 | 105.1 tok/s | 2.58x | 2.98x | 77.9 s | 1024 |
+| VRTX, max batch 32 | 127.0 tok/s | 3.11x | 3.60x | 64.5 s | 258 |
+| VRTX, max batch 64 | **130.4 tok/s** | 3.20x | **3.69x** | 62.8 s | 133 |
+
+Headline: **3.7x the throughput of naive Hugging Face** on a T4, with zero preemptions. Median time to first token at batch 64 is 0.73 s versus 99 s when requests wait in line at batch 1.
+
+Milestone status: 3.6x at 32 users, short of the 5x target. The reason is visible in the step times. One step takes about 25 ms at batch 1, 76 ms at batch 8, 250 ms at batch 32 and 470 ms at batch 64, so step time grows almost linearly with batch size. On a GPU the weight reads should be shared and nearly free per extra sequence, so the cost is per sequence work: attention still runs as a Python loop, one gather and one attention call per sequence per layer (64 x 24 = 1536 small launches per step). That is exactly what the Month 3 paged attention kernel replaces, and it is why throughput flattens between batch 32 and 64.
+
+Other runs: 4-core Linux CPU, 8 users: 3.1 to 18.2 tok/s (5.8x). Apple M4 GPU (mps, fp32), 16 users: 10.4 to 39.0 tok/s (3.7x). Raw JSON in `benchmarks/results/`.
 
 **Month 3: Kernels and quantization**
 - [ ] Triton: fused RMSNorm, RoPE, flash-style prefill attention, paged decode attention
