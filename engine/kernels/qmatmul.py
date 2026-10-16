@@ -53,7 +53,7 @@ def _qmatmul_kernel(X, Wq, S, Bias, Y, M, N, K,
 
     if HAS_BIAS:
         acc += tl.load(Bias + rn, mask=rn < N, other=0.0).to(tl.float32)[None, :]
-    tl.store(Y + rm[:, None] * stride_ym + rn[None, :], acc.to(Y.dtype.element_ty), mask=mmask & nmask)
+    tl.store(Y + rm[:, None] * stride_ym + rn[None, :], acc.to(Y.dtype.element_ty), mask=mmask & (rn < N)[None, :])
 
 
 def linear(x: torch.Tensor, w, bias=None) -> torch.Tensor:
