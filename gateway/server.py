@@ -1,12 +1,16 @@
 """VRTX Gateway: OpenAI-compatible API on top of VRTX Engine.
 
-Month 2: requests no longer wait in line. Every request joins the engine's
-continuous batch, so many users stream at the same time.
+Every request joins the engine's continuous batch, so many users stream at the same
+time. Requests that share a system prompt reuse its KV cache (prefix caching).
 
 Run:   uvicorn gateway.server:app --port 8000
 Env:   VRTX_MODEL       local folder or Hugging Face id (default: models/qwen2.5-0.5b if present)
        VRTX_KV_CACHE_MB KV cache budget in MB (default 256)
        VRTX_MAX_SEQS    max sequences per batch (default 32)
+       VRTX_QUANT       8 or 4: int8 / int4 weights (default off)
+       VRTX_PREFIX_CACHE  1 to reuse KV blocks of shared prompt prefixes (default 1)
+       VRTX_DRAFT_MODEL   draft model for speculative decoding, e.g. Qwen/Qwen2.5-0.5B-Instruct (default off)
+       VRTX_TRITON      0 to force the PyTorch ops even on CUDA
 """
 import json
 import os
@@ -44,12 +48,16 @@ async def lifespan(app: FastAPI):
         dtype=torch.float16 if device == "cuda" else torch.float32,
         kv_cache_mb=int(os.getenv("VRTX_KV_CACHE_MB", "256")),
         max_num_seqs=int(os.getenv("VRTX_MAX_SEQS", "32")),
+        quant_bits=int(os.getenv("VRTX_QUANT", "0")) or None,
+        draft=os.getenv("VRTX_DRAFT_MODEL") or None,
+        # prefix caching and speculative decoding are mutually exclusive for now
+        enable_prefix_caching=os.getenv("VRTX_PREFIX_CACHE", "1") == "1" and not os.getenv("VRTX_DRAFT_MODEL"),
     )
     aengine = AsyncLLMEngine(engine)
     yield
 
 
-app = FastAPI(title="VRTX Gateway", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="VRTX Gateway", version="0.4.0", lifespan=lifespan)
 
 
 class Message(BaseModel):

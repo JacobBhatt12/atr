@@ -8,46 +8,12 @@ import torch
 
 transformers = pytest.importorskip("transformers")
 
+from engine.batch import BatchItem, run_model  # noqa: E402
 from engine.kv_cache import BlockAllocator, NoFreeBlocks, PagedKVCache  # noqa: E402
 from engine.llm_engine import LLMEngine  # noqa: E402
 from engine.model import ModelConfig, VRTXModel  # noqa: E402
 from engine.scheduler import SamplingParams  # noqa: E402
-
-GREEDY = dict(temperature=0.0, ignore_eos=True)
-
-
-@pytest.fixture(scope="module")
-def tiny():
-    torch.manual_seed(0)
-    cfg = transformers.Qwen2Config(
-        vocab_size=97,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,  # grouped-query attention, like the real Qwen
-        max_position_embeddings=512,
-        rope_theta=10000.0,
-        tie_word_embeddings=True,
-        initializer_range=0.2,
-    )
-    hf = transformers.Qwen2ForCausalLM(cfg).eval()
-    ours = VRTXModel(ModelConfig.from_hf(hf.config), hf.state_dict())
-    return hf, ours
-
-
-def hf_greedy(hf, prompt, n):
-    ids = list(prompt)
-    with torch.no_grad():
-        for _ in range(n):
-            logits = hf(torch.tensor([ids])).logits[0, -1]
-            ids.append(int(logits.argmax()))
-    return ids[len(prompt):]
-
-
-def prompts(k, seed=1):
-    g = torch.Generator().manual_seed(seed)
-    return [torch.randint(0, 97, (int(torch.randint(3, 40, (1,), generator=g)),), generator=g).tolist() for _ in range(k)]
+from tests.conftest import GREEDY, hf_greedy, prompts  # noqa: E402
 
 
 def test_prefill_logits_match_hf(tiny):
@@ -57,9 +23,7 @@ def test_prefill_logits_match_hf(tiny):
     seq = engine.add_request(prompt, SamplingParams(max_tokens=1, **GREEDY))
     batch = engine.scheduler.schedule()
     (s, n), = batch
-    slots = engine.cache.slots(s.block_table, 0, n)
-    rows = torch.arange(n)
-    got = ours.forward(torch.tensor(prompt), torch.arange(n), [(0, n, n, slots)], slots, rows, engine.cache)
+    got = run_model(ours, engine.cache, [BatchItem(s.block_table, 0, prompt, n)])
     with torch.no_grad():
         want = hf(torch.tensor([prompt])).logits[0]
     assert torch.allclose(got, want, atol=1e-4), (got - want).abs().max()

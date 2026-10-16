@@ -1,8 +1,8 @@
 """VRTX's own transformer forward pass (Llama / Qwen2 family).
 
-We only borrow the WEIGHTS from Hugging Face. Every operation below (RMSNorm, RoPE,
+We only borrow the WEIGHTS from Hugging Face. Every operation (RMSNorm, RoPE,
 attention over the paged KV cache, the MLP) is ours, which is what lets us batch
-many sequences together and, in Month 3, swap pieces for Triton kernels.
+many sequences together and swap each op for a Triton kernel (engine/kernels/) on a GPU.
 
 Shapes use these letters:
     T  = total tokens in this step, across ALL sequences (a "ragged" flat batch)
@@ -11,11 +11,16 @@ Shapes use these letters:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
+
+from engine import ops
+from engine.batch import AttentionMetadata
 
 
 @dataclass
@@ -80,20 +85,49 @@ class SafetensorsWeights:
             return h.get_tensor(key)
 
 
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    xf = x.float()
-    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return weight * xf.to(x.dtype)
+def _resolve_ops(device, kernels):
+    """Pick the PyTorch or the Triton version of each op.
+
+    kernels: None = every Triton kernel when usable (CUDA), or an iterable of names from
+    engine.kernels.KERNELS to choose exactly which ones (benchmarks turn them on one by one).
+    """
+    from engine.kernels import KERNELS, triton_usable
+
+    if kernels is None:
+        kernels = KERNELS if triton_usable(device) and os.environ.get("VRTX_TRITON", "1") != "0" else ()
+    kernels = set(kernels)
+    if unknown := kernels - set(KERNELS):
+        raise ValueError(f"unknown kernels {unknown}; choose from {KERNELS}")
+    if kernels and not triton_usable(device):
+        raise RuntimeError("Triton kernels need a CUDA GPU (or TRITON_INTERPRET=1 for tests)")
+    o = SimpleNamespace(**{n: getattr(ops, n) for n in
+                           ("rms_norm", "add_rms_norm", "silu_and_mul", "rope_and_cache", "paged_attention", "linear")})
+    if "norm" in kernels:
+        from engine.kernels import norm
+        o.rms_norm, o.add_rms_norm = norm.rms_norm, norm.add_rms_norm
+    if "rope" in kernels:
+        from engine.kernels import rope
+        o.rope_and_cache = rope.rope_and_cache
+    if "act" in kernels:
+        from engine.kernels import activation
+        o.silu_and_mul = activation.silu_and_mul
+    if "attention" in kernels:
+        from engine.kernels import attention
+        o.paged_attention = attention.paged_attention
+    if "qmatmul" in kernels:
+        from engine.kernels import qmatmul
+        o.linear = qmatmul.linear
+    return o, frozenset(kernels)
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+LINEAR_WEIGHTS = ("wqkv", "wo", "w_gate_up", "w_down")
 
 
 class VRTXModel:
-    def __init__(self, cfg: ModelConfig, weights, device: str = "cpu", dtype: torch.dtype = torch.float32):
+    def __init__(self, cfg: ModelConfig, weights, device: str = "cpu", dtype: torch.dtype = torch.float32,
+                 kernels=None):
         self.cfg, self.device, self.dtype = cfg, device, dtype
+        self.quant_bits: int | None = None
 
         def get(key: str) -> torch.Tensor:
             return weights[key].to(device=device, dtype=dtype).contiguous()
@@ -121,80 +155,81 @@ class VRTXModel:
 
         d = cfg.head_dim
         self.inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=device) / d))
+        self.scale = d ** -0.5
+        self.set_kernels(kernels)
+
+    def set_kernels(self, kernels=None) -> None:
+        self.ops, self.kernels = _resolve_ops(self.device, kernels)
 
     @classmethod
-    def from_pretrained(cls, path: str | Path, device: str = "cpu", dtype: torch.dtype = torch.float32) -> "VRTXModel":
+    def from_pretrained(cls, path: str | Path, device: str = "cpu", dtype: torch.dtype = torch.float32,
+                        kernels=None) -> "VRTXModel":
         from transformers import AutoConfig
 
         cfg = ModelConfig.from_hf(AutoConfig.from_pretrained(str(path)))
-        return cls(cfg, SafetensorsWeights(path), device, dtype)
+        return cls(cfg, SafetensorsWeights(path), device, dtype, kernels)
 
-    # ------------------------------------------------------------------ RoPE
-    def _rope(self, positions: torch.Tensor):
-        freqs = positions.float()[:, None] * self.inv_freq[None, :]  # (T, d/2)
-        emb = torch.cat((freqs, freqs), dim=-1)  # (T, d)
-        return emb.cos().to(self.dtype)[:, None, :], emb.sin().to(self.dtype)[:, None, :]
+    # ----------------------------------------------------------- quantize
+    def quantize(self, bits: int, group_size: int = 128) -> None:
+        """Replace every transformer-layer matmul weight with int8 or int4 codes + group scales.
+        Embeddings, the LM head and the norms stay in the model dtype."""
+        from engine.quant import pick_group_size, quantize_weight
+
+        for L in self.layers:
+            for name in LINEAR_WEIGHTS:
+                w = L[name]
+                L[name] = quantize_weight(w, bits, pick_group_size(w.shape[1], group_size))
+                del w
+        self.quant_bits = bits
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.empty_cache()
+
+    def weight_bytes(self) -> dict:
+        def nbytes(t):
+            return t.nbytes() if hasattr(t, "nbytes") and callable(t.nbytes) else t.numel() * t.element_size()
+
+        linear = sum(nbytes(L[n]) for L in self.layers for n in LINEAR_WEIGHTS)
+        other = self.embed.numel() * self.embed.element_size() + self.norm.numel() * self.norm.element_size()
+        if self.lm_head is not self.embed:
+            other += self.lm_head.numel() * self.lm_head.element_size()
+        for L in self.layers:
+            other += sum(nbytes(L[n]) for n in ("ln1", "ln2", "bqkv") if L[n] is not None)
+        return {"linear_bytes": linear, "other_bytes": other, "total_bytes": linear + other}
 
     # --------------------------------------------------------------- forward
     @torch.inference_mode()
-    def forward(self, input_ids, positions, seq_meta, write_slots, logits_rows, kv_cache) -> torch.Tensor:
-        """Run one engine step.
+    def forward(self, input_ids, positions, meta: AttentionMetadata, logits_rows, kv_cache) -> torch.Tensor:
+        """Run one engine step over a flat batch of T new tokens (see engine/batch.py).
 
-        input_ids, positions : (T,)  every new token from every scheduled sequence, flattened
-        seq_meta             : list of (q_start, q_len, ctx_len, ctx_slots) per sequence
-                               ctx_slots = cache slot of every position 0..ctx_len-1
-        write_slots          : (T,)  where each new token's K and V get stored
+        input_ids, positions : (T,)
+        meta                 : which tokens belong to which sequence, and where their K/V live
         logits_rows          : rows of the flat batch that need next-token logits
         Returns logits (len(logits_rows), vocab).
         """
-        cfg = self.cfg
-        nh, nkv, d = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
+        cfg, o = self.cfg, self.ops
+        nh, nkv, d, eps = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rms_norm_eps
         T = input_ids.shape[0]
-        cos, sin = self._rope(positions)
         x = self.embed[input_ids]  # (T, H)
+        h = o.rms_norm(x, self.layers[0]["ln1"], eps)
 
         for li, L in enumerate(self.layers):
             # ---- attention block
-            h = rms_norm(x, L["ln1"], cfg.rms_norm_eps)
-            qkv = F.linear(h, L["wqkv"], L["bqkv"])  # weights read ONCE for all T tokens
+            qkv = o.linear(h, L["wqkv"], L["bqkv"])  # weights read ONCE for all T tokens
             q, k, v = qkv.split([nh * d, nkv * d, nkv * d], dim=-1)
-            q = q.view(T, nh, d)
-            k = k.view(T, nkv, d)
-            v = v.view(T, nkv, d)
-            q = q * cos + rotate_half(q) * sin
-            k = k * cos + rotate_half(k) * sin
-
-            k_cache, v_cache = kv_cache.k[li], kv_cache.v[li]  # (num_slots, nkv, d)
-            k_cache[write_slots] = k
-            v_cache[write_slots] = v
-
-            attn_out = torch.empty(T, nh, d, dtype=x.dtype, device=x.device)
-            for q_start, q_len, ctx_len, ctx_slots in seq_meta:
-                # Gather this sequence's K/V from its scattered pages.
-                # Month 3 replaces this Python loop with one Triton paged-attention kernel.
-                K = k_cache[ctx_slots]
-                V = v_cache[ctx_slots]
-                if nkv != nh:  # grouped-query attention: share each KV head across nh/nkv query heads
-                    K = K.repeat_interleave(nh // nkv, dim=1)
-                    V = V.repeat_interleave(nh // nkv, dim=1)
-                Q = q[q_start:q_start + q_len]
-                mask = None
-                if q_len > 1:  # causal: query at absolute pos (ctx_len - q_len + i) sees keys <= that pos
-                    mask = torch.ones(q_len, ctx_len, dtype=torch.bool, device=x.device).tril(ctx_len - q_len)
-                o = F.scaled_dot_product_attention(
-                    Q.transpose(0, 1), K.transpose(0, 1), V.transpose(0, 1), attn_mask=mask
-                )
-                attn_out[q_start:q_start + q_len] = o.transpose(0, 1)
-
-            x = x + F.linear(attn_out.reshape(T, nh * d), L["wo"])
+            q = o.rope_and_cache(q.view(T, nh, d), k.view(T, nkv, d), v.view(T, nkv, d), positions, self.inv_freq,
+                                 kv_cache.k[li], kv_cache.v[li], meta.write_slots)
+            attn = o.paged_attention(q, kv_cache.k[li], kv_cache.v[li], meta, self.scale)
+            x, h = o.add_rms_norm(x, o.linear(attn.reshape(T, nh * d), L["wo"]), L["ln2"], eps)
 
             # ---- MLP block (SwiGLU)
-            h = rms_norm(x, L["ln2"], cfg.rms_norm_eps)
-            gate, up = F.linear(h, L["w_gate_up"]).chunk(2, dim=-1)
-            x = x + F.linear(F.silu(gate) * up, L["w_down"])
+            mlp = o.linear(o.silu_and_mul(o.linear(h, L["w_gate_up"])), L["w_down"])
+            if li + 1 < len(self.layers):
+                x, h = o.add_rms_norm(x, mlp, self.layers[li + 1]["ln1"], eps)
+            else:
+                x = x + mlp
 
         # Only compute logits where we actually sample (saves a huge vocab matmul per prompt token).
-        x = rms_norm(x[logits_rows], self.norm, cfg.rms_norm_eps)
+        x = o.rms_norm(x[logits_rows].contiguous(), self.norm, eps)
         return F.linear(x, self.lm_head).float()
 
     def num_params(self) -> int:
