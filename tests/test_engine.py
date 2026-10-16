@@ -136,3 +136,20 @@ def test_allocator_refcounts():
 def test_kv_bytes_per_token_formula():
     cfg = ModelConfig(151936, 896, 4864, 24, 14, 2, 64, 1e-6, 1e6, True, True, 32768)  # Qwen2.5-0.5B
     assert PagedKVCache.bytes_per_token(cfg, torch.float16) == 2 * 24 * 2 * 64 * 2  # 12 KB
+
+
+GPU = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else None
+
+
+@pytest.mark.skipif(GPU is None, reason="needs a cuda or mps GPU")
+def test_fp16_on_gpu_matches_fp32_cpu(tiny):
+    """The real deployment path (fp16 weights + KV cache on a GPU) must agree with the fp32 CPU reference."""
+    hf, ours = tiny
+    gpu = VRTXModel(ours.cfg, hf.state_dict(), device=GPU, dtype=torch.float16)
+    ps = prompts(4, seed=17)
+    ref = LLMEngine(ours, num_kv_blocks=64, block_size=4).generate(ps, SamplingParams(max_tokens=8, **GREEDY))
+    got = LLMEngine(gpu, num_kv_blocks=64, block_size=4).generate(ps, SamplingParams(max_tokens=8, **GREEDY))
+    assert gpu.embed.dtype == torch.float16 and gpu.embed.device.type == GPU
+    # fp16 rounding can flip a near-tie late in a sequence, so require the first tokens to match.
+    for r, g in zip(ref, got):
+        assert g.output_ids[:4] == r.output_ids[:4]
