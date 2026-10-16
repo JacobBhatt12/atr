@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      # CPU-only torch is ~200 MB instead of ~2 GB for the CUDA build.
+      # Installing it first means requirements.txt sees torch as already satisfied.
+      - name: Install CPU torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      # Tests use a tiny random Qwen2 model, so no weights are downloaded.
+      - name: Run tests
+        run: python -m pytest tests/ -v
