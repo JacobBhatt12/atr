@@ -5,6 +5,7 @@ may share a forward pass. Batch size 1 is how the Month 1 server behaved.
 
 Run:  python -m benchmarks.bench_batching                     (uses models/qwen2.5-0.5b)
       python -m benchmarks.bench_batching --requests 32 --max-tokens 64
+      python -m benchmarks.bench_batching --hf-baseline          (also time plain HF model.generate)
 """
 import argparse
 import json
@@ -49,16 +50,50 @@ def run(engine: LLMEngine, prompts, max_tokens: int, batch: int) -> dict:
     }
 
 
+@torch.inference_mode()
+def run_hf_baseline(model_path: str, prompts, max_tokens: int, device: str, dtype) -> dict:
+    """Plain Hugging Face model.generate, one request at a time: the naive way to serve a model."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype).to(device).eval()
+    gen = dict(max_new_tokens=max_tokens, min_new_tokens=max_tokens, do_sample=False,
+               temperature=None, top_p=None, top_k=None, pad_token_id=model.config.eos_token_id)
+
+    def one(p, **overrides):
+        ids = torch.tensor([p], device=device)
+        out = model.generate(ids, attention_mask=torch.ones_like(ids), **{**gen, **overrides})
+        return out.shape[1] - ids.shape[1]
+
+    one(prompts[0], max_new_tokens=4, min_new_tokens=4)  # warm up
+    start = time.perf_counter()
+    out, finish = 0, []
+    for p in prompts:  # every request arrived at t=0 and waits for the ones before it
+        out += one(p)
+        finish.append(time.perf_counter() - start)
+    wall = time.perf_counter() - start
+    del model
+    return {
+        "engine": "hf_generate_sequential",
+        "wall_s": round(wall, 2),
+        "output_tokens": out,
+        "throughput_tok_s": round(out / wall, 2),
+        "mean_latency_s": round(statistics.mean(finish), 2),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=str(ROOT / "models" / "qwen2.5-0.5b"))
     ap.add_argument("--requests", type=int, default=16)
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--batches", default="1,4,16")
+    ap.add_argument("--kv-cache-mb", type=int, default=256, help="KV cache budget in MB")
+    ap.add_argument("--hf-baseline", action="store_true", help="also time plain HF model.generate, one request at a time")
     args = ap.parse_args()
 
     device = pick_device()
-    engine = LLMEngine.from_pretrained(args.model, device=device, dtype=torch.float16 if device == "cuda" else torch.float32)
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    engine = LLMEngine.from_pretrained(args.model, device=device, dtype=dtype, kv_cache_mb=args.kv_cache_mb)
     tok = engine.tokenizer
     prompts = []
     for i in range(args.requests):
@@ -66,7 +101,7 @@ def main():
         prompts.append(tok(tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)).input_ids)
 
     print(f"model={Path(args.model).name} device={device} params={engine.model.num_params()/1e6:.0f}M "
-          f"kv_blocks={engine.cache.num_blocks} requests={args.requests} max_tokens={args.max_tokens}")
+          f"dtype={str(dtype).split('.')[-1]} kv_blocks={engine.cache.num_blocks} requests={args.requests} max_tokens={args.max_tokens}")
     engine.generate(prompts[:1], SamplingParams(max_tokens=4, temperature=0.0))  # warm up
 
     results = []
@@ -80,13 +115,26 @@ def main():
         r["speedup_vs_batch1"] = round(r["throughput_tok_s"] / base, 2)
     print(f"  speedup at batch<={results[-1]['max_batch']}: {results[-1]['speedup_vs_batch1']}x")
 
+    hf = None
+    if args.hf_baseline:
+        hf = run_hf_baseline(args.model, prompts, args.max_tokens, device, dtype)
+        print(f"  HF generate (1 at a time): {hf['throughput_tok_s']:>8.1f} tok/s   wall {hf['wall_s']:>7.1f}s   "
+              f"mean latency {hf['mean_latency_s']:>6.1f}s")
+        for r in results:
+            r["speedup_vs_hf"] = round(r["throughput_tok_s"] / hf["throughput_tok_s"], 2)
+        best = max(results, key=lambda r: r["throughput_tok_s"])
+        print(f"  VRTX at batch<={best['max_batch']} is {best['speedup_vs_hf']}x faster than naive Hugging Face")
+
     out_dir = ROOT / "benchmarks" / "results"
     out_dir.mkdir(exist_ok=True)
     report = {"date": datetime.now().isoformat(timespec="seconds"), "model": Path(args.model).name,
-              "device": device, "requests": args.requests, "max_tokens": args.max_tokens, "runs": results}
+              "device": device, "dtype": str(dtype).split(".")[-1], "gpu": torch.cuda.get_device_name() if device == "cuda" else None,
+              "requests": args.requests, "max_tokens": args.max_tokens, "kv_cache_mb": args.kv_cache_mb,
+              "runs": results, "hf_baseline": hf}
     path = out_dir / f"batching_{device}_{datetime.now():%Y%m%d_%H%M%S}.json"
     path.write_text(json.dumps(report, indent=2))
     print(f"saved {path.relative_to(ROOT)}")
+    print("RESULTS_JSON " + json.dumps(report))
 
 
 if __name__ == "__main__":
