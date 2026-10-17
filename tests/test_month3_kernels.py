@@ -81,7 +81,7 @@ def test_paged_attention_mixed_batch(nh, nkv):
 
 
 @pytest.mark.parametrize("bits", [8, 4])
-@pytest.mark.parametrize("M", [1, 5, 40])
+@pytest.mark.parametrize("M", [1, 5, 40, 300])
 def test_quantized_matmul(bits, M):
     from engine.kernels import qmatmul
     from engine.quant import quantize_weight
@@ -93,6 +93,7 @@ def test_quantized_matmul(bits, M):
     want = torch.nn.functional.linear(x.float(), qw.dequantize().float(), b.float()).to(DT)
     got = qmatmul.linear(x, qw, b)
     torch.testing.assert_close(got, want, atol=5e-2 if DT == torch.float16 else 1e-3, rtol=2e-2)
+    torch.testing.assert_close(qmatmul.dequantize(qw), qw.dequantize())
 
 
 def test_full_model_with_all_kernels_matches_pytorch(tiny):

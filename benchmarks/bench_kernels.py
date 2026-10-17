@@ -97,6 +97,7 @@ def bench_ops(device, dtype):
                 r = row(f"int{bits}_matmul", f"{label} M={M}", t_deq, t_tri, 2 * M * N * K, qw.nbytes() + (M * K + M * N) * es)
                 r["fp16_cublas_us"] = round(t_fp16 * 1e6, 2)
                 r["speedup_vs_fp16"] = round(t_fp16 / t_tri, 2)
+                r["route"] = qmatmul._route.get((qmatmul._bucket(M), N, K, bits, qw.group_size, x.dtype))
                 out.append(r)
     return out
 

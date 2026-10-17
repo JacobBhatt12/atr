@@ -24,14 +24,14 @@ PEAKS = {"Tesla T4": (65e12, 320e9), "NVIDIA L4": (121e12, 300e9), "NVIDIA A100"
 
 
 def latest(prefix: str):
-    files = sorted(RESULTS.glob(f"{prefix}_*.json"), key=lambda p: p.stat().st_mtime)
+    files = sorted(RESULTS.glob(f"{prefix}_*.json"), key=lambda p: p.name[-20:])
     cuda = [f for f in files if "_cuda_" in f.name]
     pick = (cuda or files)[-1:] if files else []
     return json.loads(pick[0].read_text()) if pick else None
 
 
 def all_cuda(prefix: str):
-    return [json.loads(f.read_text()) for f in sorted(RESULTS.glob(f"{prefix}_cuda_*.json"), key=lambda p: p.stat().st_mtime)]
+    return [json.loads(f.read_text()) for f in sorted(RESULTS.glob(f"{prefix}_cuda_*.json"), key=lambda p: p.name[-20:])]
 
 
 def _setup():
@@ -173,6 +173,7 @@ def perplexity_vs_memory(plt):
     for x in rows:
         ax.annotate(f"{x['config']}\nppl {x['perplexity']:.2f}", (x["linear_weight_mb"], x["perplexity"]),
                     xytext=(6, 4), textcoords="offset points", fontsize=8, color=INK2)
+    ax.margins(x=0.1, y=0.12)
     ax.set_xlabel("transformer matmul weights (MB)")
     ax.set_ylabel(f"perplexity on {r['eval_text']} (lower is better)")
     ax.set_title(f"Perplexity vs memory, {r['model']}")
@@ -180,7 +181,9 @@ def perplexity_vs_memory(plt):
 
 
 def spec_vs_gamma(plt):
-    r = latest("spec")
+    runs = all_cuda("spec")
+    greedy = [x for x in runs if x.get("temperature") == 0.0]
+    r = (greedy or runs or [latest("spec")])[-1]  # the greedy sweep covers every gamma
     if not r:
         return
     fig, ax = plt.subplots(figsize=(7, 4))
@@ -195,7 +198,9 @@ def spec_vs_gamma(plt):
     ax.axhline(1, color=INK2, linewidth=1)
     ax.set_xlabel("draft tokens per round (gamma)")
     ax.set_ylabel("speedup vs no speculation")
-    ax.set_title(f"Speculative decoding, {r['target'].split('/')[-1]} + {r['draft'].split('/')[-1]} draft")
+    t = r.get("temperature", 0)
+    ax.set_title(f"Spec decoding: {r['target'].split('/')[-1]} + {r['draft'].split('/')[-1]} draft"
+                 + (", greedy" if t == 0 else f", temp {t:g}"))
     ax.legend(fontsize=8)
     _save(plt, fig, "spec_speedup_vs_gamma.png")
 
@@ -255,11 +260,12 @@ def versus(plt):
     w = 0.8 / len(engines)
     for i, (label, vals) in enumerate(engines.items()):
         xs = [k + (i - (len(engines) - 1) / 2) * w for k in range(len(workloads))]
-        bars = ax.bar(xs, [vals.get(wl, 0) for wl in workloads], w * 0.92, color=C[i], label=label)
+        have = [(x, vals[wl]) for x, wl in zip(xs, workloads) if wl in vals]  # no bar (not a 0) when not run
+        bars = ax.bar([x for x, _ in have], [v for _, v in have], w * 0.92, color=C[i], label=label)
         _bar_labels(ax, bars)
     ax.set_xticks(range(len(workloads)), workloads)
     ax.set_ylabel("output tokens / s")
-    ax.set_title("VRTX vs vLLM vs naive Hugging Face (same GPU, same prompts)")
+    ax.set_title(" vs ".join(reversed(list(engines))) + " (same GPU, same prompts)")
     ax.legend()
     ax.grid(axis="x", visible=False)
     _save(plt, fig, "vs_vllm.png")

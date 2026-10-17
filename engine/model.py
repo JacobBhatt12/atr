@@ -160,6 +160,12 @@ class VRTXModel:
 
     def set_kernels(self, kernels=None) -> None:
         self.ops, self.kernels = _resolve_ops(self.device, kernels)
+        self._warm_qmatmul()
+
+    def _warm_qmatmul(self) -> None:
+        if self.quant_bits and "qmatmul" in self.kernels:
+            from engine.kernels import qmatmul
+            qmatmul.warmup([L[n] for L in self.layers for n in LINEAR_WEIGHTS], self.dtype)
 
     @classmethod
     def from_pretrained(cls, path: str | Path, device: str = "cpu", dtype: torch.dtype = torch.float32,
@@ -183,6 +189,7 @@ class VRTXModel:
         self.quant_bits = bits
         if torch.device(self.device).type == "cuda":
             torch.cuda.empty_cache()
+        self._warm_qmatmul()
 
     def weight_bytes(self) -> dict:
         def nbytes(t):
