@@ -40,4 +40,4 @@ jobs:
       - name: Run kernel tests in the Triton interpreter
         env:
           TRITON_INTERPRET: "1"
-        run: python -m pytest tests/test_month3_kernels.py -v
+        run: python -m pytest tests/test_month3_kernels.py tests/test_cuda_graphs.py -v
