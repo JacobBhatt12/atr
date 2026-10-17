@@ -1,0 +1,66 @@
+{
+  "date": "2026-10-17T04:57:28",
+  "model": "qwen2.5-0.5b",
+  "device": "cuda",
+  "dtype": "float16",
+  "gpu": "Tesla T4",
+  "requests": 64,
+  "max_tokens": 128,
+  "kv_cache_mb": 256,
+  "kernels": [
+    "act",
+    "attention",
+    "norm",
+    "qmatmul",
+    "rope"
+  ],
+  "quant": 8,
+  "cuda_graphs": true,
+  "runs": [
+    {
+      "max_batch": 1,
+      "wall_s": 115.65,
+      "output_tokens": 8192,
+      "throughput_tok_s": 70.83,
+      "mean_latency_s": 58.8,
+      "p50_ttft_s": 57.02,
+      "engine_steps": 8192,
+      "preemptions": 0,
+      "speedup_vs_batch1": 1.0
+    },
+    {
+      "max_batch": 8,
+      "wall_s": 15.03,
+      "output_tokens": 8192,
+      "throughput_tok_s": 545.07,
+      "mean_latency_s": 8.46,
+      "p50_ttft_s": 6.601,
+      "engine_steps": 1024,
+      "preemptions": 0,
+      "speedup_vs_batch1": 7.7
+    },
+    {
+      "max_batch": 32,
+      "wall_s": 4.11,
+      "output_tokens": 8192,
+      "throughput_tok_s": 1994.35,
+      "mean_latency_s": 3.08,
+      "p50_ttft_s": 1.072,
+      "engine_steps": 258,
+      "preemptions": 0,
+      "speedup_vs_batch1": 28.16
+    },
+    {
+      "max_batch": 64,
+      "wall_s": 2.55,
+      "output_tokens": 8192,
+      "throughput_tok_s": 3212.33,
+      "mean_latency_s": 2.5,
+      "p50_ttft_s": 0.08,
+      "engine_steps": 133,
+      "preemptions": 0,
+      "speedup_vs_batch1": 45.35
+    }
+  ],
+  "hf_baseline": null
+}

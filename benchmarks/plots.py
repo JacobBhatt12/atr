@@ -69,6 +69,8 @@ def throughput_vs_users(plt):
     runs = all_cuda("batching")
     if not runs:
         return
+    day = runs[-1]["date"][:10]
+    runs = [r for r in runs if r["date"][:10] == day]  # one notebook run, so no stale lines
     series = {}
     hf = None
     for r in runs:  # newest run of each engine configuration wins

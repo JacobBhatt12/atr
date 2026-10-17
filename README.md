@@ -803,22 +803,24 @@ The first T4 run of this table topped out at 130 tok/s (3.7x HF): step time grew
 - [x] Tests: every kernel vs. its PyTorch twin (CI runs them in Triton's CPU interpreter)
 - [x] Perplexity vs. memory chart, roofline chart (`benchmarks/plots.py`)
 - [x] T4 run
-- [ ] Re-run the rewritten int8/int4 matmul on the T4 (see below)
-- **Milestone number:** **2.34x** end-to-end from the kernels (1,783 to 4,176 tok/s at 64 users); int8 halves matmul weight memory at no perplexity cost
+- [x] Re-run the rewritten int8/int4 matmul on the T4: no longer collapses at large batch, still slower than fp16 at decode (see below)
+- [ ] int8 faster than fp16 at decode: needs a GEMV-style kernel for M <= 8 (no tensor cores, split-K)
+- **Milestone number:** **2.32x** end-to-end from the kernels and **2.75x** with CUDA graphs (1,714 to 4,712 tok/s at 64 users); int8 halves matmul weight memory at no perplexity cost
 
 **Month 3 results (same T4, same model)**
 
-Kernel ablation, 64 users x 128 tokens, each row adds one kernel:
+Kernel ablation, 64 users x 128 tokens, each row adds one kernel (second T4 run):
 
 | Kernels on | Throughput | Speedup |
 |---|---|---|
-| none (PyTorch ops) | 1,783 tok/s | 1.00x |
-| + paged attention (decode + prefill) | 2,447 tok/s | 1.37x |
-| + fused RoPE + cache write | 3,220 tok/s | 1.81x |
-| + fused add + RMSNorm | 4,102 tok/s | 2.30x |
-| + fused SiLU * up | **4,176 tok/s** | **2.34x** |
+| none (PyTorch ops) | 1,714 tok/s | 1.00x |
+| + paged attention (decode + prefill) | 2,325 tok/s | 1.36x |
+| + fused RoPE + cache write | 3,097 tok/s | 1.81x |
+| + fused add + RMSNorm | 3,897 tok/s | 2.27x |
+| + fused SiLU * up | 3,970 tok/s | 2.32x |
+| + CUDA graphs | **4,712 tok/s** | **2.75x** |
 
-At batch 1 the kernels take the engine from 37.2 to 80.3 tok/s (2.2x). Per kernel vs. its PyTorch twin: RoPE + cache write 6.5x (one launch instead of ~15), add + RMSNorm 2.3-2.5x, paged decode attention 2.4-2.7x at 1-8 sequences and 1.5-1.7x at 32-64, prefill attention 1.2x, SiLU*up 1.0-2.0x (PyTorch is already one fused op for small inputs). Most small kernels sit far under the roofline (`docs/charts/roofline.png`): at T=1 a launch costs more than the work, which is the case for CUDA graphs (next section).
+At batch 1 the kernels take the engine from 35.1 to 78.2 tok/s (2.2x), and CUDA graphs double that to **157.8 tok/s** (4.5x the PyTorch engine, 4.9x naive HF). Graphs help most where launches dominate: 2.0x at batch 1, 2.1x at 8 and 32, 1.6x at 64 (`docs/charts/throughput_vs_users.png`). The first run's ablation (1,783 to 4,176 tok/s, 2.34x without graphs) agrees within run-to-run noise. Per kernel vs. its PyTorch twin: RoPE + cache write 6.5x (one launch instead of ~15), add + RMSNorm 2.3-2.5x, paged decode attention 2.4-2.7x at 1-8 sequences and 1.5-1.7x at 32-64, prefill attention 1.2x, SiLU*up 1.0-2.0x (PyTorch is already one fused op for small inputs). Most small kernels sit far under the roofline (`docs/charts/roofline.png`): at T=1 a launch costs more than the work, which is what CUDA graphs fix.
 
 Quantization (WikiText-2 test, 16K tokens, 512-token windows):
 
@@ -832,7 +834,7 @@ Quantization (WikiText-2 test, 16K tokens, 512-token windows):
 
 int8 is free in quality. int4 hurts a 0.5B model a lot; smaller groups win back half the loss for 9% more memory. Chart: `docs/charts/perplexity_vs_memory.png`.
 
-What did not work: **speed**. The first int8/int4 matmul kernel was 2-3x faster than dequantize-then-matmul in PyTorch, but still 4-7x slower than plain fp16 cuBLAS (gate_up, M=1: 571 us vs. 126 us), and 5x slower than PyTorch at M=64 (register spills from 64-row tiles with a per-element scale multiply). End to end, int8 ran at 46 tok/s at batch 1 (fp16: 81) and fell to 253 tok/s at batch 64. The rewrite in `engine/kernels/qmatmul.py`: the scale is applied once per output column per K tile instead of once per weight, weight tiles are read already transposed, tile shapes are autotuned, a Triton dequantize kernel replaces the slow PyTorch one for large M, and a router times both paths per shape once at load time and keeps the faster, so quantized can no longer be slower than dequantize + cuBLAS. Needs a T4 re-run to measure.
+What did not work: **speed**. The first int8/int4 matmul kernel was 2-3x faster than dequantize-then-matmul in PyTorch, but still 4-7x slower than plain fp16 cuBLAS (gate_up, M=1: 571 us vs. 126 us), and 5x slower than PyTorch at M=64 (register spills from 64-row tiles with a per-element scale multiply). End to end, int8 ran at 46 tok/s at batch 1 (fp16: 81) and fell to 253 tok/s at batch 64. The rewrite in `engine/kernels/qmatmul.py`: the scale is applied once per output column per K tile instead of once per weight, weight tiles are read already transposed, tile shapes are autotuned, a Triton dequantize kernel replaces the slow PyTorch one for large M, and a router times both paths per shape once at load time and keeps the faster, so quantized can no longer be slower than dequantize + cuBLAS. Second T4 run: the router picked the dequantize path for **every** shape, M=1 included, so the fused kernel still loses to dequantize + cuBLAS even at decode. What the rewrite fixed is the collapse: int8 at 64 users went from 253 to **3,212 tok/s** (with CUDA graphs; fp16 with graphs: 4,720). What it did not fix is decode speed: int8 runs at 71 tok/s at batch 1 against fp16's 158, because dequantize-then-matmul reads the int8 weight, writes an fp16 copy and reads that copy again, 5 bytes of traffic per weight instead of 2. In isolation the quantized matmul is 2.3-2.9x (int8) and 1.7-3.7x (int4) slower than fp16 cuBLAS (gate_up, M=1: 294 us vs. 127 us). So int8 is a memory win (fit a bigger model or a bigger KV cache), not a speed win, until the decode path gets a GEMV-style kernel: at M <= 8 there is nothing for tensor cores to do, and a plain load-multiply-reduce over 1-byte weights, split along K for parallelism, is bound by 1 byte per weight and could approach 2x fp16.
 
 **Month 4: Speculative decoding and prefix caching**
 - [x] Draft/target verification with the exact rejection rule (draft shares the target's block tables)
@@ -842,22 +844,30 @@ What did not work: **speed**. The first int8/int4 matmul kernel was 2-3x faster 
 - [x] T4 run and writeup vs. naive HF
 - [ ] vLLM numbers (its install failed on the Kaggle T4 run)
 - [x] CUDA graphs for decode, draft and verify steps (`engine/cuda_graphs.py`): batches padded to fixed sizes, padding rows write into a reserved null block, shorter sequences padded at the front so causality holds; tested against the eager engine in CI
-- [ ] Measure CUDA graphs on the T4 (batch 1, spec speedup vs. gamma)
-- **Milestone number:** **3,784 tok/s at 64 concurrent users** (short chat), **110x** naive Hugging Face on the same T4
+- [x] Measure CUDA graphs on the T4: 2.0x at batch 1, 1.6x at 64 users, and speculative decoding goes from 0.94x to **1.24x**
+- **Milestone number:** **3,998 tok/s at 64 concurrent users** (short chat), **128x** naive Hugging Face on the same T4
 
-**Month 4 results (same T4, same model, 64 concurrent users, prefix caching on, Triton kernels, every request forced to its full output length)**
+**Month 4 results (same T4, same model, 64 concurrent users, prefix caching on, Triton kernels, CUDA graphs, every request forced to its full output length)**
 
 | Workload | Requests | VRTX | Naive HF | vs. HF | Median TTFT | TPOT | KV waste, paged vs. static 4K reserve |
 |---|---|---|---|---|---|---|---|
-| Short chat (115 in / 200 out) | 128 | **3,784 tok/s** | 34.5 tok/s | **110x** | 3.4 s | 16.4 ms | 1.7% vs. 92.3% |
-| Shared 1K system prompt (1,064 in / 128 out) | 128 | **2,019 tok/s** | 33.5 tok/s | **60x** | 4.2 s | 30.5 ms | 0.7% vs. 70.9% |
-| Long context (4,045 in / 200 out) | 32 | 197 tok/s | not run | | 12.4 s | 98.8 ms | 0.3% vs. 0% |
+| Short chat (115 in / 200 out) | 128 | **3,998 tok/s** | 31.1 tok/s | **128x** | 3.2 s | 15.6 ms | 1.7% vs. 92.3% |
+| Shared 1K system prompt (1,064 in / 128 out) | 128 | **1,994 tok/s** | 30.0 tok/s | **66x** | 4.2 s | 31.0 ms | 0.7% vs. 70.9% |
+| Long context (4,045 in / 200 out) | 32 | 197 tok/s | not run | | 12.2 s | 99.0 ms | 0.3% vs. 0% |
 
-HF ran 16 requests per workload (one at a time, so its throughput does not depend on the count). TTFT here is mostly queueing: all requests arrive at t=0. Long context is prefill-bound: 129K prompt tokens before the first output, which is where a faster prefill (bigger chunks, a better prefill kernel) would help next. Charts: `docs/charts/vs_vllm.png`, `latency_cdf.png`, `kv_waste.png`.
+HF ran 16 requests per workload (one at a time, so its throughput does not depend on the count). Its speed varies between Kaggle sessions (31-35 tok/s; the first run measured 34.5 and 33.5, for 110x and 60x against VRTX's 3,784 and 2,019 without graphs), so read the ratios as +-10%. Graphs barely move these rows: at 64 users each step is already big enough that launches are a small share of it. TTFT here is mostly queueing: all requests arrive at t=0. Long context is prefill-bound: 129K prompt tokens before the first output, which is where a faster prefill (bigger chunks, a better prefill kernel) would help next. Charts: `docs/charts/vs_vllm.png`, `latency_cdf.png`, `kv_waste.png`.
 
-Prefix caching on its own (1,024-token shared system prompt, 64 requests, 32 at a time): **97% hit rate, 522 to 1,622 tok/s (3.1x), median TTFT 3.43 s to 1.33 s** (`docs/charts/prefix_cache.png`).
+Prefix caching on its own (1,024-token shared system prompt, 64 requests, 32 at a time): **97% hit rate, 524 to 1,597 tok/s (3.05x), median TTFT 3.47 s to 1.36 s** (`docs/charts/prefix_cache.png`).
 
-Speculative decoding (Qwen2.5-1.5B target, 0.5B draft, 8 requests x 128 tokens): **no speedup**. The draft agrees often enough (acceptance 73% at gamma 1, 51% at gamma 4, the same with sampling at temperature 0.7), but it is not cheap enough: one draft step costs **0.70x** a target step, where it should cost about 0.3x on bytes read. At batch 1 the engine is bound by kernel launches and Python, not by memory, so step time follows the layer count (24 vs. 28) rather than the parameter count (0.5B vs. 1.5B). With acceptance 0.73 and cost 0.72, gamma 1 yields 1.73 tokens for 1.72 target-steps of work: break-even, and 0.94x measured. Fixed gamma 2 to 6 gets steadily worse (0.89x to 0.62x). Adaptive gamma reads the measured cost and mostly stops speculating, so it loses only 2-3% (0.97-0.98x at batch 1), which is its job. Greedy outputs matched the target alone on 5 of 8 prompts at batch 1 and 7 of 8 at batch 4. In fp32 they match exactly (tested); in fp16, scoring several tokens at once goes through the prefill attention path, which rounds differently from the one-token decode path and can flip near-ties. The fix is CUDA graphs: capture the decode step once and replay it, so a draft step costs its memory traffic and not ~300 launches. Now built (decode, draft and verify steps are all captured); T4 numbers pending. Chart: `docs/charts/spec_speedup_vs_gamma.png`.
+Speculative decoding (Qwen2.5-1.5B target, 0.5B draft, 8 requests x 128 tokens), with CUDA graphs: **1.24x at batch 1** (gamma 2, 61.9 to 76.6 tok/s), **1.33x at batch 4** (gamma 2), 1.27x when sampling at temperature 0.7. Adaptive gamma lands at 1.22-1.23x at batch 1 without being told the best gamma, but only 1.08x at batch 4, where it settles on less speculation than the best fixed gamma.
+
+| | draft cost / target step | gamma 1 | gamma 2 | gamma 3 | gamma 4 | gamma 6 | adaptive |
+|---|---|---|---|---|---|---|---|
+| Eager, batch 1 (first run) | 0.70 | 0.94x | 0.89x | | | 0.62x | 0.97x |
+| CUDA graphs, batch 1 | **0.33** | 1.17x | **1.24x** | 1.20x | 1.15x | 1.01x | 1.22x |
+| CUDA graphs, batch 4 | 0.33 | 0.83x | **1.33x** | 1.32x | 1.20x | 1.04x | 1.08x |
+
+Why it failed the first time: one draft step cost 0.70x a target step, where it should cost about 0.3x on bytes read. Eagerly, at batch 1, the engine is bound by kernel launches and Python, so step time follows the layer count (24 vs. 28) rather than the parameter count (0.5B vs. 1.5B). Replaying a captured graph launches each step at once, the cost ratio drops to the 0.33 the bytes predict, and the same acceptance rates (73% at gamma 1, 66% at gamma 2, 51% at gamma 4) now pay off. Past gamma 3 the falling acceptance outweighs the extra drafts. The batch 4 gamma 1 dip (0.83x) is unexplained and worth a re-run. Greedy outputs matched the target alone on 5 of 8 prompts at batch 1 and 7 of 8 at batch 4. In fp32 they match exactly (tested); in fp16, scoring several tokens at once goes through the prefill attention path, which rounds differently from the one-token decode path and can flip near-ties. Chart: `docs/charts/spec_speedup_vs_gamma.png`.
 
 Known limit: prefix caching and speculative decoding can't be on at the same time yet (the draft cache would need its own prefix bookkeeping).
 

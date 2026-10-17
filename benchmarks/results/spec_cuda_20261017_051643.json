@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-17T05:16:43",
+  "device": "cuda",
+  "gpu": "Tesla T4",
+  "target": "models/qwen2.5-1.5b",
+  "draft": "models/qwen2.5-0.5b",
+  "dtype": "float16",
+  "requests": 8,
+  "max_tokens": 128,
+  "temperature": 0.7,
+  "cuda_graphs": true,
+  "rows": [
+    {
+      "batch": 1,
+      "gamma": 0,
+      "mode": "off",
+      "throughput_tok_s": 60.48,
+      "wall_s": 16.93,
+      "speedup": 1.0
+    },
+    {
+      "batch": 1,
+      "gamma": 2,
+      "mode": "fixed",
+      "throughput_tok_s": 76.8,
+      "wall_s": 13.33,
+      "spec_proposed": 853,
+      "spec_accepted": 584,
+      "spec_acceptance_rate": 0.6846,
+      "spec_tokens_per_round": 2.364,
+      "spec_cost_ratio": 0.345,
+      "speedup": 1.27
+    },
+    {
+      "batch": 1,
+      "gamma": 4,
+      "mode": "fixed",
+      "throughput_tok_s": 68.3,
+      "wall_s": 14.99,
+      "spec_proposed": 1344,
+      "spec_accepted": 674,
+      "spec_acceptance_rate": 0.5015,
+      "spec_tokens_per_round": 2.977,
+      "spec_cost_ratio": 0.341,
+      "speedup": 1.13
+    },
+    {
+      "batch": 1,
+      "gamma": 4,
+      "mode": "adaptive",
+      "throughput_tok_s": 74.25,
+      "wall_s": 13.79,
+      "spec_proposed": 916,
+      "spec_accepted": 576,
+      "spec_acceptance_rate": 0.6288,
+      "spec_tokens_per_round": 2.324,
+      "spec_cost_ratio": 0.345,
+      "speedup": 1.23
+    }
+  ]
+}
