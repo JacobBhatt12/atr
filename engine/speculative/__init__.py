@@ -79,6 +79,7 @@ class SpecDecoder:
         self.adaptive = adaptive
         self.decay = decay
         self.probe_every = probe_every
+        self.runner = None  # a cuda_graphs.GraphRunner for the draft, set by the engine
         self.cost_ratio = 0.5  # draft step time / target step time, re-measured every step
         self._draft_time = None
         self._target_time = None
@@ -138,7 +139,7 @@ class SpecDecoder:
                     items.append(BatchItem(s.block_table, s.draft_computed, s.all_ids[s.draft_computed:], 1))
                 else:
                     items.append(BatchItem(s.block_table, s.length + j - 1, [tokens[s.id][-1]], 1))
-            logits = run_model(self.model, self.cache, items)
+            logits = self.runner.run(items) if self.runner else run_model(self.model, self.cache, items)
             q = probs_batch(logits, [s.params for s in active])
             greedy = [s.params.temperature <= 0 for s in active]
             if all(greedy):

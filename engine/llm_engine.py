@@ -9,10 +9,13 @@ Options:
     enable_prefix_caching   reuse KV blocks of prompts that start the same way
     draft_model=...         speculative decoding with a smaller model of the same family
     preemption_mode="swap"  out of memory: copy KV to CPU instead of recomputing it
+    cuda_graphs=None        record small steps (decode, draft, verify) as CUDA graphs: on by default with
+                            the Triton kernels on CUDA; VRTX_CUDA_GRAPHS=0 turns it off
 """
 from __future__ import annotations
 
 import itertools
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +23,7 @@ from pathlib import Path
 import torch
 
 from engine.batch import BatchItem, run_model
+from engine.cuda_graphs import GraphRunner
 from engine.kv_cache import PagedKVCache
 from engine.model import VRTXModel, read_generation_eos
 from engine.sampling import probs_batch, sample_batch
@@ -60,6 +64,7 @@ class LLMEngine:
         draft_model: VRTXModel | None = None,
         num_speculative_tokens: int = 4,
         adaptive_speculation: bool = True,
+        cuda_graphs: bool | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -82,6 +87,20 @@ class LLMEngine:
                 raise ValueError("draft and target models must share a vocabulary")
             self.spec = SpecDecoder(draft_model, num_kv_blocks, block_size, num_speculative_tokens, adaptive_speculation)
             self.scheduler.lookahead_fn = self.spec.gamma
+        if cuda_graphs is None:
+            cuda_graphs = (torch.device(model.device).type == "cuda" and os.environ.get("VRTX_CUDA_GRAPHS", "1") != "0"
+                           and all("attention" in m.kernels for m in (model, draft_model) if m is not None))
+        self.graphs = None
+        if cuda_graphs:
+            # One block no sequence ever owns: padding rows of a graph write their K/V there.
+            null = self.cache.allocator.allocate()
+            verify_q = tuple(range(2, num_speculative_tokens + 2)) if self.spec else ()
+            self.graphs = GraphRunner(model, self.cache, null, max_num_seqs, self.max_model_len, multi_q=verify_q)
+            self.graphs.capture()
+            if self.spec:
+                self.spec.runner = GraphRunner(draft_model, self.spec.cache, null, max_num_seqs, self.max_model_len,
+                                               multi_q=(2,))
+                self.spec.runner.capture()
         self._ids = itertools.count()
         self._by_id: dict[int, Sequence] = {}
         self.total_generated = 0
@@ -167,7 +186,7 @@ class LLMEngine:
                 items.append(BatchItem(seq.block_table, start, tokens, len(tokens)))
             else:  # reached the newest token: we owe this sequence a new token
                 items.append(BatchItem(seq.block_table, start, tokens, 1 if start + n == seq.length else 0))
-        logits = run_model(self.model, self.cache, items)
+        logits = self.graphs.run(items) if self.graphs else run_model(self.model, self.cache, items)
 
         events: list[TokenEvent] = []
         plain, plain_rows, row = [], [], 0
@@ -230,6 +249,9 @@ class LLMEngine:
             "prefix_cache_hit_rate": round(s.prefix_hit_tokens / s.prefix_query_tokens, 4) if s.prefix_query_tokens else 0.0,
             "prefix_cached_blocks": self.cache.allocator.num_cached,
         }
+        if self.graphs is not None:
+            out["graph_replays"] = self.graphs.replays
+            out["graph_eager_steps"] = self.graphs.eager_steps
         if self.spec is not None:
             out.update(self.spec.stats())
         return out
