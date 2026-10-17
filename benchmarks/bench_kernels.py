@@ -121,6 +121,17 @@ def ablation(model_path, device, dtype, requests, max_tokens, batch):
         tok = sum(len(s.output_ids) for s in seqs)
         rows.append({"kernels": "+".join(ks) or "pytorch", "throughput_tok_s": round(tok / wall, 2), "wall_s": round(wall, 2)})
         print(f"  {rows[-1]['kernels']:<28} {rows[-1]['throughput_tok_s']:>8.1f} tok/s")
+    del engine
+    # last row: same kernels, decode steps replayed as CUDA graphs
+    engine = LLMEngine.from_pretrained(model_path, device=device, dtype=dtype, kernels=steps[-1], max_num_seqs=batch,
+                                       cuda_graphs=True)
+    engine.generate(prompts[:2], SamplingParams(max_tokens=4, temperature=0.0))
+    t = time.perf_counter()
+    seqs = engine.generate(prompts, params)
+    wall = time.perf_counter() - t
+    rows.append({"kernels": "+".join(steps[-1]) + "+cuda_graphs",
+                 "throughput_tok_s": round(sum(len(s.output_ids) for s in seqs) / wall, 2), "wall_s": round(wall, 2)})
+    print(f"  {rows[-1]['kernels']:<28} {rows[-1]['throughput_tok_s']:>8.1f} tok/s")
     base = rows[0]["throughput_tok_s"]
     for r in rows:
         r["speedup"] = round(r["throughput_tok_s"] / base, 2)

@@ -724,6 +724,7 @@ VRTX/
 │   ├── scheduler.py        continuous batching, chunked prefill, recompute/swap preemption
 │   ├── kv_cache.py         paged KV blocks, prefix-cache hashing, copy-on-write, swap (Month 2-4)
 │   ├── llm_engine.py       the engine loop: schedule -> (draft) -> forward -> sample/verify
+│   ├── cuda_graphs.py      decode, draft and verify steps recorded once and replayed (padded static batches)
 │   ├── async_engine.py     background thread for the server
 │   ├── kernels/            Triton: RMSNorm, RoPE+cache, SiLU, paged attention, int8/int4 matmul (Month 3)
 │   ├── quant/              int8 / int4 group quantization (Month 3)
@@ -840,7 +841,8 @@ What did not work: **speed**. The first int8/int4 matmul kernel was 2-3x faster 
 - [x] Benchmarks: prefix caching on/off, speedup vs. gamma, full serving workloads on VRTX / vLLM / HF
 - [x] T4 run and writeup vs. naive HF
 - [ ] vLLM numbers (its install failed on the Kaggle T4 run)
-- [ ] CUDA graphs for decode, so speculative decoding can pay off (see below)
+- [x] CUDA graphs for decode, draft and verify steps (`engine/cuda_graphs.py`): batches padded to fixed sizes, padding rows write into a reserved null block, shorter sequences padded at the front so causality holds; tested against the eager engine in CI
+- [ ] Measure CUDA graphs on the T4 (batch 1, spec speedup vs. gamma)
 - **Milestone number:** **3,784 tok/s at 64 concurrent users** (short chat), **110x** naive Hugging Face on the same T4
 
 **Month 4 results (same T4, same model, 64 concurrent users, prefix caching on, Triton kernels, every request forced to its full output length)**
@@ -855,7 +857,7 @@ HF ran 16 requests per workload (one at a time, so its throughput does not depen
 
 Prefix caching on its own (1,024-token shared system prompt, 64 requests, 32 at a time): **97% hit rate, 522 to 1,622 tok/s (3.1x), median TTFT 3.43 s to 1.33 s** (`docs/charts/prefix_cache.png`).
 
-Speculative decoding (Qwen2.5-1.5B target, 0.5B draft, 8 requests x 128 tokens): **no speedup**. The draft agrees often enough (acceptance 73% at gamma 1, 51% at gamma 4, the same with sampling at temperature 0.7), but it is not cheap enough: one draft step costs **0.70x** a target step, where it should cost about 0.3x on bytes read. At batch 1 the engine is bound by kernel launches and Python, not by memory, so step time follows the layer count (24 vs. 28) rather than the parameter count (0.5B vs. 1.5B). With acceptance 0.73 and cost 0.72, gamma 1 yields 1.73 tokens for 1.72 target-steps of work: break-even, and 0.94x measured. Fixed gamma 2 to 6 gets steadily worse (0.89x to 0.62x). Adaptive gamma reads the measured cost and mostly stops speculating, so it loses only 2-3% (0.97-0.98x at batch 1), which is its job. Greedy outputs matched the target alone on 5 of 8 prompts at batch 1 and 7 of 8 at batch 4. In fp32 they match exactly (tested); in fp16, scoring several tokens at once goes through the prefill attention path, which rounds differently from the one-token decode path and can flip near-ties. The fix is CUDA graphs: capture the decode step once and replay it, so a draft step costs its memory traffic and not ~300 launches. Chart: `docs/charts/spec_speedup_vs_gamma.png`.
+Speculative decoding (Qwen2.5-1.5B target, 0.5B draft, 8 requests x 128 tokens): **no speedup**. The draft agrees often enough (acceptance 73% at gamma 1, 51% at gamma 4, the same with sampling at temperature 0.7), but it is not cheap enough: one draft step costs **0.70x** a target step, where it should cost about 0.3x on bytes read. At batch 1 the engine is bound by kernel launches and Python, not by memory, so step time follows the layer count (24 vs. 28) rather than the parameter count (0.5B vs. 1.5B). With acceptance 0.73 and cost 0.72, gamma 1 yields 1.73 tokens for 1.72 target-steps of work: break-even, and 0.94x measured. Fixed gamma 2 to 6 gets steadily worse (0.89x to 0.62x). Adaptive gamma reads the measured cost and mostly stops speculating, so it loses only 2-3% (0.97-0.98x at batch 1), which is its job. Greedy outputs matched the target alone on 5 of 8 prompts at batch 1 and 7 of 8 at batch 4. In fp32 they match exactly (tested); in fp16, scoring several tokens at once goes through the prefill attention path, which rounds differently from the one-token decode path and can flip near-ties. The fix is CUDA graphs: capture the decode step once and replay it, so a draft step costs its memory traffic and not ~300 launches. Now built (decode, draft and verify steps are all captured); T4 numbers pending. Chart: `docs/charts/spec_speedup_vs_gamma.png`.
 
 Known limit: prefix caching and speculative decoding can't be on at the same time yet (the draft cache would need its own prefix bookkeeping).
 

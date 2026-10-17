@@ -91,13 +91,17 @@ def main():
     ap.add_argument("--hf-baseline", action="store_true", help="also time plain HF model.generate, one request at a time")
     ap.add_argument("--kernels", default="auto", help="'auto' (Triton on CUDA), 'none' (PyTorch ops), or e.g. attention,norm")
     ap.add_argument("--quant", type=int, choices=[8, 4], default=None, help="int8 / int4 weights")
+    ap.add_argument("--cuda-graphs", choices=["auto", "on", "off"], default="auto",
+                    help="record decode steps as CUDA graphs (auto: on with the Triton kernels on CUDA)")
     args = ap.parse_args()
 
     device = pick_device()
     dtype = torch.float16 if device == "cuda" else torch.float32
     kernels = None if args.kernels == "auto" else () if args.kernels == "none" else tuple(args.kernels.split(","))
     engine = LLMEngine.from_pretrained(args.model, device=device, dtype=dtype, kv_cache_mb=args.kv_cache_mb,
-                                       kernels=kernels, quant_bits=args.quant)
+                                       kernels=kernels, quant_bits=args.quant,
+                                       max_num_seqs=max(int(b) for b in args.batches.split(",")),
+                                       cuda_graphs={"auto": None, "on": True, "off": False}[args.cuda_graphs])
     tok = engine.tokenizer
     prompts = []
     for i in range(args.requests):
@@ -106,7 +110,7 @@ def main():
 
     print(f"model={Path(args.model).name} device={device} params={engine.model.num_params()/1e6:.0f}M "
           f"dtype={str(dtype).split('.')[-1]} kv_blocks={engine.cache.num_blocks} requests={args.requests} max_tokens={args.max_tokens} "
-          f"kernels={','.join(sorted(engine.model.kernels)) or 'pytorch'} quant={args.quant}")
+          f"kernels={','.join(sorted(engine.model.kernels)) or 'pytorch'} quant={args.quant} cuda_graphs={engine.graphs is not None}")
     engine.generate(prompts[:1], SamplingParams(max_tokens=4, temperature=0.0))  # warm up
 
     results = []
@@ -136,7 +140,7 @@ def main():
               "device": device, "dtype": str(dtype).split(".")[-1], "gpu": torch.cuda.get_device_name() if device == "cuda" else None,
               "requests": args.requests, "max_tokens": args.max_tokens, "kv_cache_mb": args.kv_cache_mb,
               "kernels": sorted(engine.model.kernels), "quant": args.quant,
-              "runs": results, "hf_baseline": hf}
+              "cuda_graphs": engine.graphs is not None, "runs": results, "hf_baseline": hf}
     path = out_dir / f"batching_{device}_{datetime.now():%Y%m%d_%H%M%S}.json"
     path.write_text(json.dumps(report, indent=2))
     print(f"saved {path.relative_to(ROOT)}")

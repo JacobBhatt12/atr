@@ -42,11 +42,14 @@ def main():
     ap.add_argument("--batches", default="1,4")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--kv-cache-mb", type=int, default=1024)
+    ap.add_argument("--cuda-graphs", choices=["auto", "on", "off"], default="auto",
+                    help="record decode steps as CUDA graphs (auto: on with the Triton kernels on CUDA)")
     args = ap.parse_args()
 
     device = pick_device()
     dtype = default_dtype(device)
-    common = dict(device=device, dtype=dtype, kv_cache_mb=args.kv_cache_mb)
+    graphs = {"auto": None, "on": True, "off": False}[args.cuda_graphs]
+    common = dict(device=device, dtype=dtype, kv_cache_mb=args.kv_cache_mb, cuda_graphs=graphs)
     params = SamplingParams(max_tokens=args.max_tokens, temperature=args.temperature, top_p=1.0, top_k=0, ignore_eos=True)
 
     base = LLMEngine.from_pretrained(args.target, **common)
@@ -65,7 +68,7 @@ def main():
     configs = [(g, False) for g in (int(x) for x in args.gammas.split(",")) if g > 0] + [(max(int(x) for x in args.gammas.split(",")), True)]
     for g, adaptive in configs:
         engine = LLMEngine(target_model, tok, stop_ids=stop, draft_model=draft_model, num_speculative_tokens=g,
-                           adaptive_speculation=adaptive, kv_cache_mb=args.kv_cache_mb)
+                           adaptive_speculation=adaptive, kv_cache_mb=args.kv_cache_mb, cuda_graphs=graphs)
         for b in [int(x) for x in args.batches.split(",")]:
             r, outs = run(engine, prompts, params, b)
             if args.temperature == 0:  # greedy speculation must reproduce the target exactly
@@ -84,7 +87,7 @@ def main():
         r["speedup"] = round(r["throughput_tok_s"] / off["throughput_tok_s"], 2)
     save("spec", device, {"target": args.target, "draft": args.draft, "dtype": str(dtype).split(".")[-1],
                           "requests": args.requests, "max_tokens": args.max_tokens, "temperature": args.temperature,
-                          "rows": rows})
+                          "cuda_graphs": graphs is not False and device == "cuda", "rows": rows})
 
 
 if __name__ == "__main__":

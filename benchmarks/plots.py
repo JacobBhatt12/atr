@@ -75,6 +75,8 @@ def throughput_vs_users(plt):
         label = "VRTX + Triton kernels" if r.get("kernels") else "VRTX, PyTorch ops"
         if r.get("quant"):
             label += f", int{r['quant']}"
+        if r.get("cuda_graphs"):
+            label += " + CUDA graphs"
         series[label] = r["runs"]
         hf = (r.get("hf_baseline") or {}).get("throughput_tok_s") or hf
     fig, ax = plt.subplots(figsize=(7, 4))

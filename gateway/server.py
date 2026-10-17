@@ -11,6 +11,7 @@ Env:   VRTX_MODEL       local folder or Hugging Face id (default: models/qwen2.5
        VRTX_PREFIX_CACHE  1 to reuse KV blocks of shared prompt prefixes (default 1)
        VRTX_DRAFT_MODEL   draft model for speculative decoding, e.g. Qwen/Qwen2.5-0.5B-Instruct (default off)
        VRTX_TRITON      0 to force the PyTorch ops even on CUDA
+       VRTX_CUDA_GRAPHS 0 to run decode steps eagerly instead of replaying CUDA graphs
 """
 import json
 import os
