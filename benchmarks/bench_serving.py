@@ -16,6 +16,7 @@ Run:  python -m benchmarks.bench_serving --engine vrtx
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import time
 
@@ -91,6 +92,8 @@ def run_vrtx(args, device, dtype, workload, n):
 
 def run_vllm(args, device, dtype, workload, n):
     from transformers import AutoTokenizer
+    # main() has already touched CUDA, and a forked vLLM worker can't re-initialize it
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from vllm import LLM, SamplingParams as VSP
 
     tok = AutoTokenizer.from_pretrained(args.model)
