@@ -842,18 +842,20 @@ What did not work: **speed**. The first int8/int4 matmul kernel was 2-3x faster 
 - [x] Prefix hashing, reference counts, LRU eviction of cached blocks, copy-on-write
 - [x] Benchmarks: prefix caching on/off, speedup vs. gamma, full serving workloads on VRTX / vLLM / HF
 - [x] T4 run and writeup vs. naive HF
-- [ ] vLLM numbers (its install failed on the Kaggle T4 run)
+- [x] vLLM numbers on the same T4: VRTX is within 9% of vLLM 0.31 on short chat, 4% on shared prefix, and 1.45x faster on long context
 - [x] CUDA graphs for decode, draft and verify steps (`engine/cuda_graphs.py`): batches padded to fixed sizes, padding rows write into a reserved null block, shorter sequences padded at the front so causality holds; tested against the eager engine in CI
 - [x] Measure CUDA graphs on the T4: 2.0x at batch 1, 1.6x at 64 users, and speculative decoding goes from 0.94x to **1.24x**
-- **Milestone number:** **3,998 tok/s at 64 concurrent users** (short chat), **128x** naive Hugging Face on the same T4
+- **Milestone number:** **3,998 tok/s at 64 concurrent users** (short chat), **128x** naive Hugging Face and **0.91x vLLM** on the same T4
 
 **Month 4 results (same T4, same model, 64 concurrent users, prefix caching on, Triton kernels, CUDA graphs, every request forced to its full output length)**
 
-| Workload | Requests | VRTX | Naive HF | vs. HF | Median TTFT | TPOT | KV waste, paged vs. static 4K reserve |
-|---|---|---|---|---|---|---|---|
-| Short chat (115 in / 200 out) | 128 | **3,998 tok/s** | 31.1 tok/s | **128x** | 3.2 s | 15.6 ms | 1.7% vs. 92.3% |
-| Shared 1K system prompt (1,064 in / 128 out) | 128 | **1,994 tok/s** | 30.0 tok/s | **66x** | 4.2 s | 31.0 ms | 0.7% vs. 70.9% |
-| Long context (4,045 in / 200 out) | 32 | 197 tok/s | not run | | 12.2 s | 99.0 ms | 0.3% vs. 0% |
+| Workload | Requests | VRTX | vLLM 0.31 | vs. vLLM | Naive HF | vs. HF | Median TTFT | TPOT | KV waste, paged vs. static 4K reserve |
+|---|---|---|---|---|---|---|---|---|---|
+| Short chat (115 in / 200 out) | 128 | **3,998 tok/s** | 4,376 tok/s | 0.91x | 31.1 tok/s | **128x** | 3.2 s | 15.6 ms | 1.7% vs. 92.3% |
+| Shared 1K system prompt (1,064 in / 128 out) | 128 | **1,994 tok/s** | 2,085 tok/s | 0.96x | 30.0 tok/s | **66x** | 4.2 s | 31.0 ms | 0.7% vs. 70.9% |
+| Long context (4,045 in / 200 out) | 32 | **197 tok/s** | 136 tok/s | **1.45x** | not run | | 12.2 s | 99.0 ms | 0.3% vs. 0% |
+
+vLLM 0.31.0 (torch 2.13, CUDA 13.0) ran with the same prompts, 64 sequences, prefix caching on, fp16, and its defaults otherwise: torch.compile, its own CUDA graphs, and the Triton attention backend (FlashAttention needs a newer GPU than the T4). It runs in its own virtual environment on the notebook, in a separate Kaggle session from the VRTX rows, on the same GPU model. On short requests vLLM's step overhead is lower: VRTX is 9% behind at 64 users, 4% behind when most of the prompt is cached. On 4K-token prompts VRTX is 1.45x faster. That is one run and the cause is not pinned down; vLLM's warning that its Triton attention kernel was still compiling during the timed run suggests part of the gap is warm-up for the long shapes, not steady state.
 
 HF ran 16 requests per workload (one at a time, so its throughput does not depend on the count). Its speed varies between Kaggle sessions (31-35 tok/s; the first run measured 34.5 and 33.5, for 110x and 60x against VRTX's 3,784 and 2,019 without graphs), so read the ratios as +-10%. Graphs barely move these rows: at 64 users each step is already big enough that launches are a small share of it. TTFT here is mostly queueing: all requests arrive at t=0. Long context is prefill-bound: 129K prompt tokens before the first output, which is where a faster prefill (bigger chunks, a better prefill kernel) would help next. Charts: `docs/charts/vs_vllm.png`, `latency_cdf.png`, `kv_waste.png`.
 
