@@ -11,7 +11,7 @@ VRTX is three systems that work as one:
 | **VRTX Ops** | An AI that reads crash logs and metrics and explains what broke, running on VRTX Engine itself | Datadog, PagerDuty, AWS DevOps Guru |
 
 Owner: Jacob Bhatt ([@JacobBhatt12](https://github.com/JacobBhatt12))
-Started: October 2026
+Started: June 2026
 Target: ~9 months
 Budget: $0
 
@@ -76,7 +76,7 @@ Everything here is free and open source.
 |---|---|
 | **PyTorch** | Tensor math, running the model layers |
 | **Hugging Face `transformers` + `safetensors`** | Downloading and loading model weights; also the "naive baseline" we benchmark against |
-| **Open-weight models** | Qwen 2.5 (0.5B to 7B), Llama 3, Mistral 7B, Gemma. Free to download from Hugging Face |
+| **Open-weight models** | Qwen 2.5 (0.5B to 7B), Llama 3, Mistral 7B, Gemma. |
 | **vLLM** | Not part of VRTX. Only used as the "pro" benchmark to compare against |
 
 ### Backend and APIs
@@ -730,17 +730,22 @@ VRTX/
 │   ├── quant/              int8 / int4 group quantization (Month 3)
 │   └── speculative/        draft proposals, exact verify rule, adaptive gamma (Month 4)
 ├── gateway/                FastAPI front door
-│   └── server.py           OpenAI-compatible API
+│   ├── server.py           OpenAI-compatible API (what a model replica runs)
+│   └── proxy.py            routes <name>.vrtx.local to healthy replicas, streaming (Month 5)
 ├── cloud/                  VRTX Cloud
+│   ├── state.py            SQLite cluster state; every write is one apply(command) (Month 5, Raft-ready)
+│   ├── spec.py             deployment specs (vrtx.yaml), validation, engine env vars
+│   ├── up.py               control plane + agent + gateway in one process (`vrtx up`)
 │   ├── raft/               consensus (Month 6)
-│   ├── api/                control plane REST API (Month 5)
-│   ├── scheduler/          bin packing (Month 6)
+│   ├── api/                control plane REST API + reconcile loop (Month 5)
+│   ├── scheduler/          placement.py: filter + spread (Month 5); bin packing (Month 6)
 │   ├── autoscaler/         Erlang C + forecasting (Month 7)
 │   ├── router/             consistent hashing (Month 7)
-│   ├── builder/            git -> image (Month 5)
-│   └── agent/              worker node agent (Month 5)
+│   ├── builder/            code folder -> Docker image or prepared folder, content-hash cache (Month 5)
+│   └── agent/              worker agent: Docker / process runtimes, health checks, heartbeats (Month 5)
 ├── ops/                    VRTX Ops (Month 8)
-├── cli/                    `vrtx` command (Month 5+)
+├── cli/                    `vrtx` command: up, deploy, models deploy, ps, logs, scale, rm, nodes (Month 5)
+├── examples/               todo-api (FastAPI) and hello-static, for `vrtx deploy`
 ├── dashboard/              Next.js web UI (Month 8)
 ├── benchmarks/
 │   ├── bench_naive.py      Month 1 baseline
@@ -876,12 +881,45 @@ Known limit: prefix caching and speculative decoding can't be on at the same tim
 ### Phase 2: VRTX Cloud and Ops (Months 5 to 8)
 
 **Month 5: Workers and deploys**
-- [ ] Worker agent (start/stop containers, report GPU memory)
-- [ ] Control plane API (single node first)
-- [ ] Builder: code folder to Docker image
-- [ ] Gateway routes `*.vrtx.local` to apps
-- [ ] `vrtx deploy`, `vrtx ps`, `vrtx logs`
-- **Milestone:** deploy an app and a model with one command each
+- [x] Worker agent (`cloud/agent/`): starts/stops replicas as Docker containers (CPU/memory limits, `--gpus all` on NVIDIA nodes) or as local processes; reports CPUs, RAM and GPU memory (nvidia-smi); health-checks every replica; heartbeats every 2 s
+- [x] Control plane API (`cloud/api/server.py`), single node: deployments, builds, nodes, routes, merged logs; a reconcile loop that places replicas, restarts crashed ones with exponential backoff (crashloop after 3), reschedules replicas of silent nodes, and does rolling updates
+- [x] State in SQLite, written only through `apply(command)` with ids and timestamps inside the command, so Month 6 can put the same commands on the Raft log (tested: replaying the commands gives the same state)
+- [x] Builder: code folder to Docker image. Uses the folder's Dockerfile, else detects FastAPI / Flask / a Python script / Node / static HTML and writes one; builds keyed by a hash of the files, so an unchanged redeploy reuses the image and rolls nothing out
+- [x] Gateway (`gateway/proxy.py`) routes `*.vrtx.local` and `*.localhost` to healthy replicas, round-robin, streaming (SSE passes through), skips dead replicas
+- [x] `vrtx up`, `vrtx deploy`, `vrtx models deploy`, `vrtx ps`, `vrtx logs [-f]`, `vrtx scale`, `vrtx rm`, `vrtx nodes`
+- [x] Tests (`tests/test_month5_cloud.py`): a full deploy -> serve -> crash -> roll out -> scale -> delete run on the process runtime, so CI needs no Docker
+- **Milestone:** deploy an app and a model with one command each: **done**. `vrtx deploy ./examples/todo-api` (build 19 s first time, 1 s cached; 2 replicas healthy 3 s later) and `vrtx models deploy ./models/qwen2.5-0.5b --name qwen-chat` (engine image 215 s the first time; weights loaded and healthy 13 s later)
+
+**Month 5 results (MacBook Air, Apple silicon, Docker Desktop, one node)**
+
+| What | Result |
+|---|---|
+| Rolling update under load (`curl` loop, 1 GET + 1 POST at a time) | **0 failed of 3,442 requests** (1,721 GET, 1,721 POST) |
+| Same, before draining | 3 failed of 1,525 (502s: old replicas were killed while the gateway still routed to them) |
+| Rollout time, 2 replicas | 4 s (15 s before agent stops went to the background) |
+| Container killed with `docker kill` | replaced automatically within seconds; exit code 137 and the last log lines kept as the deployment's last error |
+| App that exits on startup | `crashloop` after 3 tries with its real error (`DATABASE_URL is not set`), first retry at once, then 2 s, 4 s, 8 s ... up to 60 s |
+| Whole stack restarted | deployments come back at the same version once the agent re-registers (~2 s) |
+| `vrtx up` stopped (SIGTERM) | exits in ~2 s, 0 containers left behind |
+| Qwen2.5-0.5B, Docker runtime | 3.4 tok/s (Docker on macOS has no GPU: fp32 on CPU) |
+| Qwen2.5-0.5B, process runtime | 22 tok/s on the Mac's GPU (MPS), TTFT 0.08 s |
+
+What made rollouts lossless: (1) old replicas are **drained**, taken out of the routing table and stopped 3 s later, which is longer than the gateway's 1 s route refresh; (2) generated Dockerfiles `exec` the app so `docker stop`'s SIGTERM reaches it (as PID 1, `/bin/sh` ignores SIGTERM, so every stop took the full 5 s timeout); (3) the gateway retries the next replica when a connection fails, and also for idempotent requests when a replica drops mid-request.
+
+Try it (needs Docker for `--runtime docker`; `--runtime process` runs replicas as local processes):
+
+```
+pip install -e .            # gives you the `vrtx` command
+vrtx up                     # control plane :7070, agent :7071, gateway :8080
+vrtx deploy ./examples/todo-api
+curl http://todo-api.localhost:8080/todos       # *.localhost needs no DNS setup
+vrtx models deploy ./models/qwen2.5-0.5b --name qwen-chat
+curl http://qwen-chat.localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+     -d '{"messages": [{"role": "user", "content": "hi"}]}'
+vrtx ps -a && vrtx logs todo-api -f
+```
+
+For `*.vrtx.local` names add them to `/etc/hosts` (`127.0.0.1 todo-api.vrtx.local`) or send a `Host:` header. Known limits: one control plane (Raft is Month 6); the process runtime only works when the builder and the worker share a machine; no WebSocket proxying yet; health checks are HTTP only.
 
 **Month 6: Raft and scheduling**
 - [ ] Raft: elections, log replication, commit, persistence
