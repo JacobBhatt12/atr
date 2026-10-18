@@ -1,0 +1,30 @@
+{
+  "date": "2026-10-18T02:51:18",
+  "device": "cuda",
+  "gpu": "Tesla T4",
+  "engine": "hf",
+  "model": "qwen2.5-0.5b",
+  "users": 64,
+  "prefix_caching": false,
+  "quant": null,
+  "rows": [
+    {
+      "workload": "short_chat",
+      "requests": 16,
+      "prompt_tokens_mean": 114.9,
+      "output_tokens": 200,
+      "throughput_tok_s": 35.08,
+      "wall_s": 91.22,
+      "e2e_p50_s": 48.5595
+    },
+    {
+      "workload": "shared_prefix",
+      "requests": 16,
+      "prompt_tokens_mean": 1064.4,
+      "output_tokens": 128,
+      "throughput_tok_s": 33.72,
+      "wall_s": 60.73,
+      "e2e_p50_s": 32.2947
+    }
+  ]
+}
