@@ -30,7 +30,18 @@ From `python -m benchmarks.bench_atr`, using the tiktoken `cl100k` tokenizer. Th
 | `git diff`: 2 code edits + a lockfile change | 22,294 | 207 | **99.1%** (lockfile listed, not shown) |
 | Re-reading 200 lines after a 1-line edit | 1,626 | 77 | **95.3%** (only the changed line comes back) |
 
+| Playwright page snapshot (Hacker News front page) | 12,023 | 4,046 | **66.3%** (every text, link and click target kept) |
+
 **In a real coding agent the gain is smaller.** Claude Code and Codex already trim their own commands (`| tail -60`, `git diff --stat`). In a live Claude Code test (review a change, find why 3 of 306 tests fail), both runs used about 50k input tokens, with or without ATR. For coders, ATR pays off on the MCP servers you plug in (GitHub, browsers, databases, logs), whose results the agent gets in full.
+
+**Playwright, live** (open Hacker News, click "new", open a GitHub issues page; same answers every time; one run each, and runs vary a lot):
+
+| Agent | Without ATR | With ATR |
+|---|---|---|
+| Codex | 173.5k input tokens, 27.6k of them uncached | 145.2k (**−16%**), 13.1k uncached (**−52%**) |
+| Claude Code (Sonnet) | $0.235, then $0.067 on a second run | $0.229, then $0.191 |
+
+Codex gets every page snapshot in full, so ATR's snapshot compaction helps. Claude Code already loads MCP tools only when needed and saves huge results to a file, and in its cheaper run it skipped snapshots and ran small scripts in the page instead. Behind ATR it went back to snapshots and took more turns, so for Playwright in Claude Code, ATR doesn't help yet.
 
 Compression runs locally in 1–270 ms. It doesn't call a model or the network.
 
@@ -93,7 +104,7 @@ atr setup
 1. moves the app's MCP servers behind ATR (only the ones that run on your machine; remote servers that need a sign-in stay where they are), and
 2. adds ATR to the app.
 
-Restart the app and it works: tool lists and tool results go through ATR and get smaller. `atr setup --undo` puts every app back exactly as it was, and each changed file also gets an `.atr-backup` copy. `atr setup --dry-run` only shows the plan.
+Restart the app and it works: tool lists and tool results go through ATR and get smaller. `atr setup --undo` puts every app back exactly as it was. To update later: `pip install --upgrade "git+https://github.com/JacobBhatt12/atr"`, and each changed file also gets an `.atr-backup` copy. `atr setup --dry-run` only shows the plan.
 
 **No MCP servers yet?** Use the demo instead. It's a built-in fake server with 50 tools (GitHub, Slack, logs, a database, a calendar), so you can watch the savings right away:
 
@@ -249,7 +260,7 @@ atr/                ATR (stdlib only; HTTP mode needs .[http])
   router.py         BM25 tool search, schema slimming, one-line signatures
   config.py · cli.py · tokens.py
   setup.py          atr setup: add ATR to your AI apps, with their servers moved behind it
-  tests/            41 tests and a fake 50-tool server (python -m pytest atr/tests -c /dev/null)
+  tests/            43 tests and a fake 50-tool server (python -m pytest atr/tests -c /dev/null)
 benchmarks/bench_atr.py       the savings table above
 gen-context.config.json       settings for SigMap, which runs behind ATR (only the tools ATR doesn't have)
 ```

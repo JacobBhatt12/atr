@@ -276,3 +276,56 @@ def test_setup_allows_atr_read_tools_in_claude_code(tmp_path, monkeypatch):
     assert added == ["mcp__atr__atr_read_file"]
     cc.disallow(added)
     assert json.loads((tmp_path / "settings.json").read_text()) == {"permissions": {"allow": ["Bash(ls:*)"]}, "theme": "dark"}
+
+
+SNAPSHOT = '''### Page
+- Page URL: https://news.ycombinator.com/
+### Snapshot
+```yaml
+- table [ref=e3]:
+  - rowgroup [ref=e4]:
+    - row [ref=e5]:
+      - cell "1." [ref=e33]
+      - cell [ref=e38]:
+        - generic [ref=e39]:
+          - link "Xbox Turns Down Netflix $500M Offer" [ref=e40] [cursor=pointer]:
+            - /url: https://www.darkhorizons.com/xbox-turns-down-netflix-500-million-offer/
+          - text: "|"
+          - generic [ref=e46]:
+            - text: 57 points by
+            - link "xoxxala" [ref=e47] [cursor=pointer]:
+              - /url: user?id=xoxxala
+      - cell [ref=e60]:
+        - textbox "Search" [ref=e61]:
+          - /placeholder: Search stories
+        - generic [aria-hidden] [ref=e62]: "1"
+```
+'''
+
+
+def test_browser_snapshot_keeps_text_and_refs_drops_layout():
+    from atr.compress import compact_snapshot, compress
+    c = compact_snapshot(SNAPSHOT)
+    assert '- Page URL: https://news.ycombinator.com/' in c  # the page header is left alone
+    assert 'link "Xbox Turns Down Netflix $500M Offer" [ref=e40] → darkhorizons.com/xbox-turns-down' in c
+    assert '57 points by' in c and 'link "xoxxala" [ref=e47] → user?id=xoxxala' in c and 'cell "1." [ref=e33]' in c
+    assert 'textbox "Search" [ref=e61] (placeholder: Search stories)' in c
+    assert "rowgroup" not in c and "cursor=pointer" not in c and '"|"' not in c and "aria-hidden" not in c
+    assert tokens.count(c) < tokens.count(SNAPSHOT) * 0.6
+    big = SNAPSHOT.replace("```\n", "".join(f'  - link "Story {i}" [ref=x{i}] [cursor=pointer]:\n    - /url: item?id={i}\n'
+                                             for i in range(200)) + "```\n")
+    r = compress(big, budget=1500)
+    assert not r.lossy and "Story 199" in r.text  # a compacted page isn't cut to the normal budget
+
+
+def test_atr_call_accepts_arguments_as_a_json_string():
+    srv = ATRServer(Config(servers={"fake": {"command": sys.executable, "args": ["-m", "atr.tests.fake_server"]}}))
+
+    async def go():
+        await srv.start()
+        try:
+            res = await srv.call("atr_read", {"tool": "fake__github_get_issue", "args": '{"owner": "a", "repo": "b"}'})
+            assert not res["isError"]
+        finally:
+            await srv.close()
+    asyncio.run(go())

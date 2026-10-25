@@ -331,6 +331,9 @@ def head_tail(s: str, budget: int) -> str:
 
 # ---------------------------------------------------------------- entry point
 
+SNAPSHOT_BUDGET = 5000
+
+
 def compress(raw: Any, budget: int | None = None, level: int = 2) -> Result:
     """Compress a tool result (str, or already-parsed JSON). `budget` is a soft token cap."""
     original = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2)
@@ -338,13 +341,20 @@ def compress(raw: Any, budget: int | None = None, level: int = 2) -> Result:
     value, is_data = parse(raw)
     notes: list[str] = []
 
+    snap = None if is_data else compact_snapshot(value)
+
     def attempt(o: Opts) -> tuple[str, bool]:
         if is_data:
             return render_data(value, o)
+        if snap is not None:
+            return snap, False
         return clean_text(value, o), False
 
     o = LEVELS.get(level, LEVELS[2])
     text, lossy = attempt(o)
+    if snap is not None and budget:
+        # a compacted page is what the model works from; cutting it costs more turns than it saves
+        budget = max(budget, SNAPSHOT_BUDGET)
     if budget and tokens.count(text) > budget:
         for o2 in SQUEEZE:
             if o2.level < o.level:
@@ -456,3 +466,80 @@ def compress_output(raw: str, budget: int | None = None, level: int = 2) -> Resu
         notes.append("cut to head and tail")
     kept = f"[atr: {'; '.join(notes)}]\n{kept}"
     return Result(text=kept, before=before, after=tokens.count(kept), lossy=True, notes=notes)
+
+
+# ---------------------------------------------------------------- browser page snapshots (Playwright & co.)
+
+ARIA_LINE = re.compile(r'^(?P<ind>\s*)- (?P<role>[\w/-]+)(?: "(?P<name>(?:[^"\\]|\\.)*)")?(?P<attrs>(?: \[[^\]]*\])*)'
+                       r'(?P<colon>:)?(?: (?P<val>.*))?$')
+# Containers that only say "a box is here": dropped when they carry no name or text; children move up.
+LAYOUT_ROLES = {"generic", "group", "rowgroup", "row", "cell", "gridcell", "list", "listitem", "table", "none",
+                "presentation", "region", "section", "paragraph", "separator", "LayoutTable", "LayoutTableRow",
+                "LayoutTableCell", "Section", "contentinfo", "banner", "complementary", "main", "navigation",
+                "article", "figure", "term", "definition", "strong", "emphasis", "Iframe", "iframe"}
+JUNK_ATTRS = re.compile(r" \[(cursor=pointer|aria-hidden|box=[^\]]*)\]")
+
+
+def _short_url(u: str) -> str:
+    u = u.strip().strip('"')
+    u = re.sub(r"^https?://(www\.)?", "", u)
+    return u if len(u) <= 70 else u[:67] + "…"
+
+
+def compact_snapshot(text: str) -> str | None:
+    """An accessibility snapshot (Playwright MCP's YAML) with the layout boxes taken out: every visible
+    text, every element you can act on (with its ref) and a short URL stay; empty wrappers, cursor
+    hints and separators go. Returns None if `text` isn't a snapshot."""
+    if "[ref=" not in text or not re.search(r"^\s*- \w+.*\[ref=\w+\]", text, re.M):
+        return None
+    out: list[str] = []
+    stack: list[tuple[int, bool]] = []  # (original indent, kept?) of the open ancestors
+    last_kept_at: dict[int, int] = {}   # depth -> index in out of the last kept line at that depth
+    fenced = "```yaml" in text
+    inside = not fenced
+    for ln in text.splitlines():
+        if fenced and ln.strip().startswith("```"):
+            inside = ln.strip() != "```" or not inside
+            out.append(ln)
+            continue
+        m = ARIA_LINE.match(ln) if inside else None
+        if not m:
+            out.append(ln)
+            stack.clear()
+            continue
+        ind = len(m["ind"])
+        while stack and stack[-1][0] >= ind:
+            stack.pop()
+        depth = sum(1 for _, k in stack if k)
+        role, name, val = m["role"], m["name"], (m["val"] or "").strip()
+        attrs = JUNK_ATTRS.sub("", m["attrs"] or "")
+        if role == "/url":
+            parent = last_kept_at.get(depth - 1)
+            if parent is not None and "→" not in out[parent] and val and not val.startswith("javascript:"):
+                out[parent] += f" → {_short_url(val)}"
+            stack.append((ind, False))
+            continue
+        if role.startswith("/"):  # /placeholder and similar: fold into the parent line
+            parent = last_kept_at.get(depth - 1)
+            if parent is not None and val:
+                out[parent] += f" ({role[1:]}: {val[:60]})"
+            stack.append((ind, False))
+            continue
+        if "[aria-hidden" in (m["attrs"] or ""):
+            stack.append((ind, False))
+            continue
+        if role == "text":
+            v = val.strip('"').strip()
+            if not v or not re.search(r"\w", v):  # "|", "(", ")" and other glue
+                stack.append((ind, False))
+                continue
+            line = f"{' ' * depth}{v}"
+        elif role in LAYOUT_ROLES and not name and not val:
+            stack.append((ind, False))
+            continue
+        else:
+            line = f"{' ' * depth}{role}" + (f' "{name}"' if name else "") + attrs + (f": {val}" if val else "")
+        out.append(line)
+        last_kept_at[depth] = len(out) - 1
+        stack.append((ind, True))
+    return "\n".join(out)

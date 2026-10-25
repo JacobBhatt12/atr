@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atr"
-version = "0.1.0"
+version = "0.2.0"
 description = "ATR: Automation for Token Reduction. An MCP proxy that hides tool schemas and compresses tool results."
 readme = "README.md"
 license = "MIT"

@@ -523,7 +523,13 @@ class ATRServer:
             if name == "atr_read" and tool in self.tools and not self.is_read_only(tool):
                 return text_result(f"{tool} can change things, so it isn't allowed through atr_read. "
                                    f"Use atr_call (the user may be asked to approve it).", True)
-            return await self.call_downstream(tool, a.get("arguments") or {}, a.get("budget"))
+            args = a.get("arguments", a.get("args", a.get("input"))) or {}
+            if isinstance(args, str):  # models sometimes send the arguments as a JSON string
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    return text_result("arguments must be an object, e.g. {\"url\": \"https://…\"}", True)
+            return await self.call_downstream(tool, args, a.get("budget"))
         if name == "atr_query":
             return self.query_ref(a)
         if name in FILE_TOOLS and not self.allow_read_files:
