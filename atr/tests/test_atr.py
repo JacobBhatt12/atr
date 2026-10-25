@@ -220,3 +220,19 @@ def test_stdio_handshake():
     assert len(out[1]["result"]["tools"]) == 10
     assert "Connected" not in out[1]["result"]["tools"][0]["description"]  # nothing connected, no line
 
+
+
+def test_core_tools_always_load_and_search_names_the_rest():
+    async def go():
+        srv = ATRServer(Config(servers=FAKE))
+        await srv.start()
+        try:
+            meta = {t["name"]: t.get("_meta") for t in srv.list_tools()}
+            assert meta["atr_find_tools"] == {"anthropic/alwaysLoad": True} and meta["atr_read_file"] is None
+            found = (await srv.call("atr_find_tools", {"query": "list github issues", "k": 2}))["content"][0]["text"]
+            assert "also on fake:" in found and "slack_send_message" in found
+        finally:
+            await srv.close()
+        bare = ATRServer(Config())
+        assert all("_meta" not in t for t in bare.list_tools())  # nothing behind ATR: nothing forced into the prompt
+    run(go())

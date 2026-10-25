@@ -260,7 +260,7 @@ atr/                ATR (stdlib only; HTTP mode needs .[http])
   router.py         BM25 tool search, schema slimming, one-line signatures
   config.py · cli.py · tokens.py
   setup.py          atr setup: add ATR to your AI apps, with their servers moved behind it
-  tests/            43 tests and a fake 50-tool server (python -m pytest atr/tests -c /dev/null)
+  tests/            44 tests and a fake 50-tool server (python -m pytest atr/tests -c /dev/null)
 benchmarks/bench_atr.py       the savings table above
 gen-context.config.json       settings for SigMap, which runs behind ATR (only the tools ATR doesn't have)
 ```

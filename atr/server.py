@@ -70,7 +70,9 @@ INSTRUCTIONS = (
     "returns 'unchanged' or only the changed lines; pass fresh=true if you no longer have it. "
     "Tools from connected servers are hidden: atr_find_tools with a short task description, then atr_read "
     "for tools marked [r] (read-only) or atr_call for [w] (they change something and may need approval). "
-    "Large results come back summarized with a ref; use atr_query on the ref instead of calling the tool again.")
+    "Large results come back summarized with a ref; use atr_query on the ref instead of calling the tool again. "
+    "Browsers: to pull data out of a page, a page script (e.g. browser_evaluate returning just the titles) costs "
+    "far less than a full snapshot; take snapshots when you need refs to click.")
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 CALL_SCHEMA = {"type": "object", "properties": {
@@ -164,6 +166,7 @@ META_TOOLS = [
 ]
 
 
+CORE_TOOLS = {"atr_find_tools", "atr_read", "atr_call", "atr_query"}
 FILE_TOOLS = {"atr_read_file", "atr_repo_map", "atr_search_code", "atr_diff"}
 CODE_TOOLS = {"atr_repo_map", "atr_search_code", "atr_diff", "atr_run"}
 
@@ -260,6 +263,10 @@ class ATRServer:
                 continue
             if t["name"] == "atr_find_tools" and summary:
                 t = dict(t, description=t["description"] + summary)
+            if t["name"] in CORE_TOOLS and self.downstreams:
+                # Claude Code hides MCP tools until the model searches for them; these four are ATR's whole
+                # interface to the servers behind it, so a lookup round for them would only cost a turn
+                t = dict(t, _meta={"anthropic/alwaysLoad": True})
             tools.append(t)
         names = self.tools if self.cfg.expose == "all" else [p for p in self.cfg.pin if p in self.tools]
         tools += [self._exposed(n, self.tools[n][1]) for n in names]
@@ -325,6 +332,11 @@ class ATRServer:
             servers = ", ".join(f"{n} ({len(d.tools)})" for n, d in self.downstreams.items())
             return text_result(f"No tools match {q!r}. Servers: {servers}. Try other words.")
         lines = [f"[{'r' if self.is_read_only(n) else 'w'}] {signature(n, self.tools[n][1])}" for n, _ in hits]
+        shown = {n for n, _ in hits}
+        for server in dict.fromkeys(n.split(SEP, 1)[0] for n, _ in hits):  # the rest of each server, names only
+            more = [n.split(SEP, 1)[1] for n in self.tools if n.startswith(server + SEP) and n not in shown]
+            if more:
+                lines.append(f"also on {server}: " + ", ".join(more[:40]) + (f", … {len(more) - 40} more" if len(more) > 40 else ""))
         lines.append("[r]: run with atr_read. [w]: run with atr_call.")
         if detail:
             lines += ["", "schemas:"] + [f"{n}: {json.dumps(slim_schema(self.tools[n][1].get('inputSchema') or {}), separators=(',', ':'))}"
