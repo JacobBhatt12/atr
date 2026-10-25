@@ -148,5 +148,10 @@ def main(argv: list[str] | None = None) -> None:
     a.fn(a)
 
 
+def serve_main() -> None:
+    """`atr-mcp [options]` = `atr serve [options]`, for launchers that run the package's own command."""
+    main(["serve", *sys.argv[1:]])
+
+
 if __name__ == "__main__":
     main()

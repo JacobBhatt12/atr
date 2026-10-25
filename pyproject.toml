@@ -1,19 +1,35 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "atr"
-version = "0.2.1"
-description = "ATR: Automation for Token Reduction. An MCP proxy that hides tool schemas and compresses tool results."
+name = "atr-mcp"
+version = "0.3.0"
+description = "ATR: Automation for Token Reduction. An MCP proxy that hides tool lists and shrinks tool results so your AI uses fewer tokens."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jacob Bhatt" }]
+keywords = ["mcp", "model-context-protocol", "llm", "tokens", "claude", "codex", "ai-agents", "proxy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
 requires-python = ">=3.11"
 # ATR itself needs nothing outside the standard library.
 dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/JacobBhatt12/atr"
+Repository = "https://github.com/JacobBhatt12/atr"
+Issues = "https://github.com/JacobBhatt12/atr/issues"
 
 [project.optional-dependencies]
 exact = ["tiktoken>=0.7"]                # exact token counts instead of the chars/4 estimate
@@ -23,6 +39,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 atr = "atr.cli:main"
+atr-mcp = "atr.cli:serve_main"   # `uvx atr-mcp` starts the MCP server (what MCP registries run)
 
 [tool.setuptools.packages.find]
 include = ["atr*"]

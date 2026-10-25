@@ -1,8 +1,12 @@
 # ATR: Automation for Token Reduction
 
+<!-- mcp-name: io.github.JacobBhatt12/atr -->
+
 **ATR makes your AI use fewer tokens when it works with tools.** Fewer tokens means lower bills and fewer "usage limit reached" messages.
 
 It works with Claude Code, Codex, Claude Desktop, Cursor, Windsurf, claude.ai and ChatGPT. It's free and runs on your own computer.
+
+![ATR demo: 1,000 GitHub issues go from 329,732 tokens to 1,442, and the tool list from 12,376 to 1,438](https://raw.githubusercontent.com/JacobBhatt12/atr/main/assets/demo.gif)
 
 ## The problem
 

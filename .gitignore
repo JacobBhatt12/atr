@@ -7,3 +7,9 @@ node_modules/
 .context/
 .env
 .venv-atr/
+dist/
+build/
+*.egg-info/
+# private launch notes
+LAUNCH-CHECKLIST.md
+*.docx

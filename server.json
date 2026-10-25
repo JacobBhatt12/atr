@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.JacobBhatt12/atr",
+  "title": "ATR: Automation for Token Reduction",
+  "description": "MCP proxy that hides tool lists and shrinks tool results so your AI uses fewer tokens.",
+  "repository": {
+    "url": "https://github.com/JacobBhatt12/atr",
+    "source": "github"
+  },
+  "version": "0.3.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "atr-mcp",
+      "version": "0.3.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
