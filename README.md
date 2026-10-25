@@ -15,15 +15,22 @@ Owner: Jacob Bhatt ([@JacobBhatt12](https://github.com/JacobBhatt12)) · Started
 
 ## Measured savings
 
-From `python -m benchmarks.bench_atr`, using the tiktoken `cl100k` tokenizer. The test server has 50 tools and returns results shaped like real ones (GitHub REST payloads, service logs, web pages). The raw numbers are in `benchmarks/results/atr_*.json`.
+From `python -m benchmarks.bench_atr`, using the tiktoken `cl100k` tokenizer. The MCP rows use a test server with 50 tools whose results are shaped like real ones (GitHub REST payloads, service logs, web pages). The coding rows run in a throwaway project: a real `pytest -v` run, a real git repo, and install/jest logs shaped like real ones. The raw numbers are in `benchmarks/results/atr_*.json`.
 
 | Scenario | Before | After | Saved |
 |---|---:|---:|---:|
-| 50 tool schemas, paid on every turn | 11,256 | 541 | **95.2%** (+134 per `atr_find_tools` call) |
+| 50 tool schemas, paid on every turn | 12,056 | 1,508 | **87.5%** (+159 per `atr_find_tools` call) |
 | 1,000 GitHub issues (JSON), 1,500-token budget | 429,203 | 879 | **99.8%** (the rest is kept for `atr_query`) |
 | 30 GitHub issues, nothing cut | 12,878 | 3,448 | **73.2%** |
-| 2,000-line service log, 600-token budget | 61,072 | 206 | **99.7%** (the error and traceback are kept) |
+| 2,000-line service log, 600-token budget | 61,072 | 208 | **99.7%** (the error and traceback are kept) |
 | Fetched web page (HTML) | 930 | 350 | **62.4%** |
+| `pytest -v`: 303 tests, 3 failing | 6,685 | 675 | **89.9%** (all 3 failures and the summary kept) |
+| jest: one config error in 40 test files | 8,778 | 152 | **98.3%** (first error kept, the rest counted) |
+| `pip install`, 60 packages | 5,977 | 697 | **88.3%** |
+| `git diff`: 2 code edits + a lockfile change | 22,294 | 207 | **99.1%** (lockfile listed, not shown) |
+| Re-reading 200 lines after a 1-line edit | 1,626 | 77 | **95.3%** (only the changed line comes back) |
+
+**In a real coding agent the gain is smaller.** Claude Code and Codex already trim their own commands (`| tail -60`, `git diff --stat`). In a live Claude Code test (review a change, find why 3 of 306 tests fail), both runs used about 50k input tokens, with or without ATR. For coders, ATR pays off on the MCP servers you plug in (GitHub, browsers, databases, logs), whose results the agent gets in full.
 
 Compression runs locally in 1–270 ms. It doesn't call a model or the network.
 
@@ -126,18 +133,21 @@ If ATR says `No module named 'atr'` on macOS, the install's `.pth` files were fl
 
 ### Coding tools
 
-For coding, ATR adds four tools that cut the usual token sinks: opening whole files, wide searches, and long test or build output.
+For coding, ATR adds five tools that cut the usual token sinks: opening whole files, wide searches, diffs full of lockfiles, and long test or build output.
 
 | Tool | Instead of | Example on this repo |
 |---|---|---|
 | `atr_repo_map` | opening files one by one to learn the layout | whole project, with each file's functions and classes: **~3,000 tokens** (reading every `.py` file: ~159,000) |
 | `atr_search_code` | grep output that runs for pages | results grouped by file, capped per file, `glob=` to narrow it down |
 | `atr_read_file` | reading a 500-line file to see one function | an outline first, then `lines="120-180"`, or `search=` with `context=` |
-| `atr_run` | 3,000 lines of test output | exit code + the failures; repeated lines collapsed; full output kept for `atr_query` |
+| `atr_diff` | `git diff` with a 20,000-line lockfile in it | 1 line of context; lockfiles, generated and binary files listed but not shown; secret files never shown |
+| `atr_run` | 3,000 lines of test output | exit code + failures, errors, warnings and the summary wherever they are; passing tests and progress dropped; the same error block repeated in 40 files shown once; full output kept for `atr_query` |
 
-- **Read-only tools:** `atr_repo_map`, `atr_search_code` and `atr_read_file`. Code output is only ever trimmed by length, so indentation is never touched.
+`atr_read_file` also remembers what it showed you: reading the same part again returns "unchanged", and after an edit only the changed lines (`fresh=true` sends it all).
+
+- **Read-only tools:** `atr_repo_map`, `atr_search_code`, `atr_read_file` and `atr_diff`. `atr setup` lets Claude Code run them without asking. Code output is only ever trimmed by length, so indentation is never touched.
 - **`atr_run`** is marked as changing things, so clients ask before running it.
-- **Where they work:** all four stay inside `read_roots` and start in `project` (default: the folder ATR was started from).
+- **Where they work:** all of them stay inside `read_roots` and start in `project` (default: the folder ATR was started from).
 - **Local apps:** in Claude Code, Cursor and similar apps, they're on by default.
 - **Over `--http`:** they're off unless you start with `--read-files`, plus `--allow-run` for commands. Add `--project <folder>` to limit them to one folder: anyone with the link gets what those flags allow.
 - **Secrets are never read, listed or searched, in any mode:** `.env` files, SSH and other private keys, cloud credentials, ATR's own token, and data files whose names say they hold keys, passwords or tokens (for example `Access-Keys.ini`). Template files like `.env.example` are fine.
@@ -238,7 +248,8 @@ atr/                ATR (stdlib only; HTTP mode needs .[http])
   stash.py          full results kept by ref + atr_query
   router.py         BM25 tool search, schema slimming, one-line signatures
   config.py · cli.py · tokens.py
-  tests/            34 tests and a fake 50-tool server (python -m pytest atr/tests -c /dev/null)
+  setup.py          atr setup: add ATR to your AI apps, with their servers moved behind it
+  tests/            41 tests and a fake 50-tool server (python -m pytest atr/tests -c /dev/null)
 benchmarks/bench_atr.py       the savings table above
 gen-context.config.json       settings for SigMap, which runs behind ATR (only the tools ATR doesn't have)
 ```

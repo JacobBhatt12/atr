@@ -67,8 +67,14 @@ def local_spec(spec: dict) -> dict | None:
 # ------------------------------------------------------------------ apps
 
 
+# ATR tools that only read; Claude Code may run these without asking (atr_run and atr_call still ask).
+READ_TOOLS = ["atr_find_tools", "atr_query", "atr_read_file", "atr_repo_map", "atr_search_code", "atr_diff", "atr_stats"]
+
+
 class App:
     key = label = ""
+    def allow(self, rules: list[str]) -> list[str]: return []  # permission rules added, for --undo
+    def disallow(self, rules: list[str]) -> None: ...
 
     def present(self) -> bool: ...
     def servers(self) -> dict[str, dict]: ...      # name -> the app's own entry
@@ -134,6 +140,31 @@ class ClaudeCode(App):
 
     def to_app(self, spec: dict) -> dict:
         return {"type": "stdio", **spec}
+
+    def _settings(self) -> Path:
+        base = os.environ.get("CLAUDE_CONFIG_DIR")
+        return (Path(base) if base else Path.home() / ".claude") / "settings.json"
+
+    def allow(self, rules: list[str]) -> list[str]:
+        f = self._settings()
+        d = json.loads(f.read_text() or "{}") if f.exists() else {}
+        have = d.setdefault("permissions", {}).setdefault("allow", [])
+        added = [r for r in rules if r not in have]
+        if added:
+            backup(f)
+            have.extend(added)
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(d, indent=2) + "\n")
+        return added
+
+    def disallow(self, rules: list[str]) -> None:
+        f = self._settings()
+        if not rules or not f.exists():
+            return
+        d = json.loads(f.read_text() or "{}")
+        allow = (d.get("permissions") or {}).get("allow") or []
+        d.setdefault("permissions", {})["allow"] = [r for r in allow if r not in rules]
+        f.write_text(json.dumps(d, indent=2) + "\n")
 
 
 def toml_value(v) -> str:
@@ -245,6 +276,8 @@ def run(yes: bool = False, only: list[str] | None = None, dry_run: bool = False,
         out(f"    servers moved behind ATR: {', '.join(move) or 'none'}")
         for n, r in keep.items():
             out(f"    stays in {a.label}: {n} ({r})")
+        if isinstance(a, ClaudeCode):
+            out("    ATR's read-only tools run without asking (searching, reading, diffs); atr_run still asks")
     out("Backups are written next to each changed file, and `atr setup --undo` puts everything back.")
     if dry_run:
         return 0
@@ -277,6 +310,8 @@ def run(yes: bool = False, only: list[str] | None = None, dry_run: bool = False,
         if "atr" in a.servers():
             a.remove("atr")
         a.add("atr", a.to_app(atr_entry()))
+        record["allowed"] = sorted(set(record.get("allowed", [])) | set(a.allow([f"mcp__atr__{t}" for t in READ_TOOLS])))
+        write_private(state_path(), json.dumps(state, indent=2) + "\n")
         out(f"✓ {a.label}: ATR added, {len(move)} server(s) moved behind it")
     out("Restart the apps (or start a new chat) to pick up the change.")
     return 0
@@ -299,6 +334,7 @@ def undo(only: list[str] | None = None, out=print) -> int:
             if name not in current:
                 a.add(name, info["spec"])
             servers.pop(info["as"], None)
+        a.disallow(state[a.key].get("allowed", []))
         del state[a.key]
         out(f"✓ {a.label}: back to how it was")
     write_private(DEFAULT_PATH, json.dumps(cfg, indent=2) + "\n")

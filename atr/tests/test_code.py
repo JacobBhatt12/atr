@@ -207,3 +207,72 @@ def test_search_code_context_shows_surrounding_lines(tmp_path):
     assert "def other" not in out
     plain = search_code(tmp_path, "def target", None, 2000)
     assert "return 1" not in plain
+
+
+def test_command_output_keeps_failures_in_the_middle():
+    from atr.compress import compress_output
+    out = ["collected 2003 items"] + [f"tests/test_a.py::test_{i} PASSED [ {i // 20}%]" for i in range(1000)]
+    out += ["tests/test_a.py::test_login FAILED", "    def test_login():", ">       assert status == 200",
+            "E       assert 500 == 200", "tests/test_a.py:41: AssertionError"]
+    out += [f"tests/test_b.py::test_{i} PASSED [ {50 + i // 20}%]" for i in range(1000)]
+    out += ["Downloading foo-1.0.tar.gz (12 kB)"] * 0 + ["=== 1 failed, 2000 passed in 3.1s ==="]
+    r = compress_output("\n".join(out), budget=300)
+    assert "assert 500 == 200" in r.text and "tests/test_a.py:41" in r.text and "1 failed, 2000 passed" in r.text
+    assert r.after < 300
+
+
+def test_command_output_folds_repeated_error_blocks():
+    from atr.compress import compress_output
+    block = ("FAIL src/m{0}.test.js\n  ● Test suite failed to run\n\n    Cannot find module 'ts-jest' from 'jest.config.js'\n\n"
+             "      at Resolver.resolveModule (node_modules/jest-resolve/build/index.js:{0}:11)\n")
+    r = compress_output("\n".join(block.format(i) for i in range(40)) + "\nTest Suites: 40 failed, 40 total\n", budget=5000)
+    assert r.text.count("Cannot find module") == 1 and "39 more block(s)" in r.text and "40 failed" in r.text
+    assert r.lossy  # folded, so the full output is worth stashing
+
+
+def test_rereading_a_file_returns_unchanged_or_only_the_changes(tmp_path):
+    srv = srv_for(make_project(tmp_path))
+    args = {"path": "big.py", "lines": "1-60"}
+    first = call(srv, "atr_read_file", args)["content"][0]["text"]
+    again = call(srv, "atr_read_file", args)["content"][0]["text"]
+    assert "unchanged since you read it" in again and tokens.count(again) < tokens.count(first) / 5
+    text = (tmp_path / "big.py").read_text().replace("return x + 7\n", "return x * 7\n", 1)
+    (tmp_path / "big.py").write_text(text)
+    changed = call(srv, "atr_read_file", args)["content"][0]["text"]
+    assert "changed since you last read it" in changed and "+16:     return x * 7" in changed and "-16:     return x + 7" in changed
+    assert tokens.count(changed) < tokens.count(first) / 3
+    full = call(srv, "atr_read_file", {**args, "fresh": True})["content"][0]["text"]
+    assert full.startswith("big.py lines 1-60")
+
+
+def test_diff_hides_lockfiles_and_secrets(tmp_path):
+    import subprocess
+    git = lambda *a: subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a], cwd=tmp_path,
+                                    check=True, capture_output=True)
+    make_project(tmp_path)
+    (tmp_path / "package-lock.json").write_text("{}\n")
+    git("init", "-q"); git("add", "src", "package-lock.json", "README.md"); git("commit", "-qm", "init")
+    (tmp_path / "package-lock.json").write_text("\n".join(f'"pkg{i}": "1.0.{i}",' for i in range(2000)))
+    (tmp_path / "src" / "app.py").write_text((tmp_path / "src" / "app.py").read_text().replace("# TODO: rate limit", "limit(user)"))
+    (tmp_path / ".env").write_text("API_KEY=sk-live-123\n")
+    git("add", "-N", ".env")
+    srv = srv_for(tmp_path)
+    text = call(srv, "atr_diff", {})["content"][0]["text"]
+    assert "+    limit(user)" in text and "-    # TODO: rate limit" in text
+    assert "package-lock.json (+2000 -1) [lockfile/generated: not shown]" in text and "pkg5" not in text
+    assert ".env" in text and "sk-live" not in text
+    assert srv.stats["results_before"] > 10 * srv.stats["results_after"]  # vs. a plain git diff
+    assert call(srv, "atr_diff", {"file": ".env"})["isError"]
+    assert call(srv, "atr_diff", {"ref": "--output=/tmp/x"})["isError"]
+
+
+def test_setup_allows_atr_read_tools_in_claude_code(tmp_path, monkeypatch):
+    import json
+    from atr import setup
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}, "theme": "dark"}))
+    cc = setup.ClaudeCode()
+    added = cc.allow(["mcp__atr__atr_read_file", "Bash(ls:*)"])
+    assert added == ["mcp__atr__atr_read_file"]
+    cc.disallow(added)
+    assert json.loads((tmp_path / "settings.json").read_text()) == {"permissions": {"allow": ["Bash(ls:*)"]}, "theme": "dark"}

@@ -3,6 +3,7 @@
   repo_map     the project's layout and the main functions/classes in each file
   search_code  regex search across the project, grouped by file and capped
   run          a shell command (tests, builds, linters) with its output compressed
+  git_diff     the working-tree (or staged, or vs. a ref) diff without lockfiles, generated files or secrets
 
 Every result goes through the same compression and budget as other tool results; anything
 cut is stashed, so atr_query can page through the rest.
@@ -259,3 +260,93 @@ async def run(command: str, cwd: Path, timeout: float) -> tuple[int | None, str,
         out, _ = await proc.communicate()
         code = None
     return code, out.decode(errors="replace"), time.monotonic() - t0
+
+
+# ------------------------------------------------------------------ git diff
+
+GENERATED = re.compile(
+    r"(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|poetry\.lock|Pipfile\.lock|"
+    r"uv\.lock|pdm\.lock|Cargo\.lock|Gemfile\.lock|composer\.lock|go\.sum|flake\.lock|Podfile\.lock|packages\.lock\.json)$|"
+    r"\.min\.(js|css)$|\.map$|\.snap$|_pb2\.pyi?$|\.pb\.go$|\.generated\.\w+$|"
+    r"(^|/)(dist|build|out|\.next|coverage|__snapshots__|vendor)/")
+REF = re.compile(r"[\w./~^@{}:-]+")
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    r = subprocess.run(["git", "-c", "core.quotepath=off", *args], cwd=str(cwd), capture_output=True, text=True,
+                       errors="replace", timeout=60)
+    if r.returncode != 0:
+        raise ValueError(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"git {args[0]} failed")
+    return r.stdout
+
+
+def git_diff(root: Path, ref: str | None = None, staged: bool = False, file: str | None = None,
+             budget: int = 1500) -> tuple[str, int]:
+    """(compact diff, tokens a plain `git diff` would have cost). Lockfiles, generated and binary files
+    are listed but not shown; secret-looking files never show their content."""
+    top = Path(_git(["rev-parse", "--show-toplevel"], root).strip())
+    if ref and (ref.startswith("-") or not REF.fullmatch(ref)):
+        raise ValueError(f"not a git ref: {ref!r}")
+    if file and (file.startswith("-") or is_secret(top / file)):
+        raise ValueError(f"{file} looks like a secret (keys, tokens, .env); ATR never shows those.")
+    base = ["diff", "--no-color", "--no-ext-diff"] + (["--staged"] if staged else []) + ([ref] if ref else [])
+    scope = ["--", file] if file else []
+    plain = _git(base + scope, top)
+    numstat = _git(base + ["--numstat"] + scope, top)
+    compact = _git(base + ["-U1"] + scope, top)
+    stat = {}
+    for ln in numstat.splitlines():
+        a, d, path = ln.split("\t", 2)
+        stat[path.split(" => ")[-1].strip("{}")] = (a, d)
+    hunks: dict[str, list[str]] = {}
+    cur = None
+    for ln in compact.splitlines():
+        if ln.startswith("diff --git "):
+            cur = ln.split(" b/", 1)[-1]
+            hunks[cur] = []
+        elif cur is not None and not ln.startswith(("index ", "--- ", "+++ ", "similarity index", "new file mode",
+                                                    "deleted file mode", "old mode", "new mode")):
+            hunks[cur].append(ln)
+    plus = sum(int(a) for a, _ in stat.values() if a.isdigit())
+    minus = sum(int(d) for _, d in stat.values() if d.isdigit())
+    what = f"staged changes" if staged else (f"changes since {ref}" if ref else "uncommitted changes")
+    out = [f"{what}: {len(hunks)} file(s), +{plus} -{minus}"]
+    used = tokens.count(out[0])
+    hidden = []
+    for path, body in hunks.items():
+        a, d = stat.get(path, ("?", "?"))
+        head = f"== {path} (+{a} -{d})"
+        if is_secret(top / path):
+            out.append(f"{head} [secret-looking file: content not shown]")
+            continue
+        if a == "-" or any("Binary files" in ln for ln in body):
+            out.append(f"{head} [binary]")
+            continue
+        if GENERATED.search(path):
+            out.append(f"{head} [lockfile/generated: not shown]")
+            continue
+        text = "\n".join([head] + [ln[:300] for ln in body])
+        cost = tokens.count(text)
+        if used + cost > budget and not file:
+            hidden.append(f"{head} [not shown: atr_diff(file=\"{path}\")]")
+            continue
+        if used + cost > budget:  # one file asked for, still too big: keep the start
+            keep, total = [], used
+            for ln in text.splitlines():
+                total += tokens.count(ln) + 1
+                if total > budget:
+                    keep.append(f"… {len(text.splitlines()) - len(keep)} more lines (narrow it with ref= or a smaller change)")
+                    break
+                keep.append(ln)
+            text = "\n".join(keep)
+        out.append(text)
+        used += tokens.count(text)
+    out += hidden
+    if not staged and not ref and not file:
+        untracked = [u for u in _git(["ls-files", "--others", "--exclude-standard"], top).splitlines()]
+        if untracked:
+            names = ", ".join(untracked[:15]) + (f", … {len(untracked) - 15} more" if len(untracked) > 15 else "")
+            out.append(f"new files not in git yet ({len(untracked)}): {names}")
+    if len(out) == 1:
+        out.append("(no changes)")
+    return "\n".join(out), tokens.count(plain)

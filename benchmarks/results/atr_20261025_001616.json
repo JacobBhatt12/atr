@@ -1,0 +1,75 @@
+{
+  "tokenizer": "tiktoken",
+  "rows": [
+    {
+      "scenario": "50 tool schemas, sent every turn",
+      "before": 12056,
+      "after": 1508,
+      "saved_pct": 87.5,
+      "note": "+159 tokens per atr_find_tools call"
+    },
+    {
+      "scenario": "1,000 GitHub issues (JSON), 1,500 budget",
+      "before": 429203,
+      "after": 879,
+      "saved_pct": 99.8,
+      "note": "289 ms, rest stashed for atr_query"
+    },
+    {
+      "scenario": "30 GitHub issues, no budget (lossless)",
+      "before": 12878,
+      "after": 3448,
+      "saved_pct": 73.2,
+      "note": "8 ms"
+    },
+    {
+      "scenario": "2,000-line service log, 600 budget",
+      "before": 61072,
+      "after": 208,
+      "saved_pct": 99.7,
+      "note": "29 ms"
+    },
+    {
+      "scenario": "Fetched web page (HTML)",
+      "before": 930,
+      "after": 350,
+      "saved_pct": 62.4,
+      "note": "1 ms"
+    },
+    {
+      "scenario": "pytest -v: 303 tests, 3 failing",
+      "before": 6685,
+      "after": 675,
+      "saved_pct": 89.9,
+      "note": "all 3 failures and the summary kept"
+    },
+    {
+      "scenario": "jest: one config error in 40 suites",
+      "before": 8778,
+      "after": 152,
+      "saved_pct": 98.3,
+      "note": "first error kept, the rest counted"
+    },
+    {
+      "scenario": "pip install, 60 packages",
+      "before": 5977,
+      "after": 697,
+      "saved_pct": 88.3,
+      "note": "the final 'Successfully installed' kept"
+    },
+    {
+      "scenario": "git diff: 2 code edits + package-lock.json",
+      "before": 22294,
+      "after": 207,
+      "saved_pct": 99.1,
+      "note": "code changes shown, lockfile listed"
+    },
+    {
+      "scenario": "re-reading 200 lines after a 1-line edit",
+      "before": 1626,
+      "after": 77,
+      "saved_pct": 95.3,
+      "note": "only the changed line comes back"
+    }
+  ]
+}

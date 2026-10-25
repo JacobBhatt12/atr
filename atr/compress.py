@@ -363,3 +363,96 @@ def compress(raw: Any, budget: int | None = None, level: int = 2) -> Result:
         if tokens.count(text) > before:
             text = original
     return Result(text=text, before=before, after=tokens.count(text), lossy=lossy, notes=notes)
+
+
+# ---------------------------------------------------------------- command output (tests, builds, installs)
+
+# Lines worth keeping wherever they are: failures, errors, tracebacks, file:line pointers, summaries.
+IMPORTANT = re.compile(
+    r"error|fail|exception|traceback|panic|fatal|assert|warning|\bwarn\b|denied|not found|cannot|can't|"
+    r"unable to|undefined|unexpected|invalid|missing|refused|timed? ?out|segmentation|killed|abort|"
+    r"\bnot ok\b|✗|✕|✘|×|^E\s|^>\s|^\s*File \"|\.\w{1,5}:\d+|^\s+at \S+ \(|^=+ .* =+$|^-+ .* -+$|"
+    r"\b\d+ (passed|failed|errors?|skipped|warnings?|tests?|suites?)\b|^(Tests?|Test Suites|Ran \d+|OK\b|FAILED)",
+    re.I)
+# Lines that say nothing when things went well: passing tests, downloads, progress.
+NOISE = re.compile(
+    r"(PASSED|\bPASS\b|\bok\b|✓|✔)\s*(\[\s*\d+%\])?\s*$|^\s*(✓|✔|PASS\b)|^\s*(Downloading|Downloaded|Collecting|"
+    r"Requirement already satisfied|Using cached|Installing collected|Obtaining|Preparing|Building wheel|"
+    r"Created wheel|Stored in|Fetching|Resolving|Compiling|Checking|Fresh|Updating|Locking|Adding|Audited|"
+    r"Progress|Reading|Unpacking|Selecting|Setting up|Processing|Get:\d|Hit:\d|Ign:\d|copying|creating|"
+    r"running \w|\[\d+/\d+\]|remote:|Receiving objects|Resolving deltas|Counting objects)|^\s*[.sx]+\s*(\[\s*\d+%\])?$",
+    re.I)
+
+
+CARETS = re.compile(r"^[\s^~|]*\^[\s^~]*$")  # ^^^^ under a line: points at a column, says nothing new
+
+
+def fold_blocks(text: str) -> str:
+    """The same error block repeated (one per test file, one per package): keep the first, count the rest.
+    A block starts at a line with no indent and runs until the next one (jest's FAIL x, cargo's error[E…])."""
+    blocks: list[list[str]] = []
+    for ln in text.splitlines():
+        if CARETS.match(ln) and ln.strip():
+            continue
+        if not blocks or (ln[:1].strip() and blocks[-1] and any(x.strip() for x in blocks[-1])):
+            blocks.append([])
+        blocks[-1].append(ln)
+    out: list[list[str]] = []
+    first: dict[str, int] = {}
+    repeats: dict[int, list[str]] = {}
+    for blk in blocks:
+        body = [ln for ln in blk if ln.strip()]
+        shape = DIGITS.sub("#", "\n".join(body))
+        if len(body) >= 3 and shape in first:
+            repeats.setdefault(first[shape], []).append(body[0].strip()[:60])
+            continue
+        first.setdefault(shape, len(out))
+        out.append(blk)
+    for i, heads in repeats.items():
+        names = ", ".join(heads[:3]) + (f", … {len(heads) - 3} more" if len(heads) > 3 else "")
+        blk = out[i]
+        end = len(blk)
+        while end and not blk[end - 1].strip():
+            end -= 1
+        blk.insert(end, f"[atr: {len(heads)} more block(s) just like this one: {names}]")
+    return "\n".join(ln for blk in out for ln in blk)
+
+
+def compress_output(raw: str, budget: int | None = None, level: int = 2) -> Result:
+    """Command output: when it is too long, keep what explains the result (failures, errors,
+    tracebacks, warnings, the summary at the end) and drop passing tests and progress lines."""
+    o = LEVELS.get(level, LEVELS[2])
+    before = tokens.count(raw)
+    text = fold_blocks(clean_text(raw, o))
+    folded = "[atr: " in text and "[atr: " not in raw
+    if not budget or tokens.count(text) <= budget:
+        return Result(text=text, before=before, after=tokens.count(text), lossy=folded)
+    lines = text.splitlines()
+    n = len(lines)
+    keep = [False] * n
+    noise = [bool(NOISE.search(ln)) and not IMPORTANT.search(ln) for ln in lines]
+    for i, ln in enumerate(lines):
+        if not noise[i] and IMPORTANT.search(ln):
+            for j in range(max(0, i - 2), min(n, i + 4)):  # a little context; tracebacks run downwards
+                keep[j] = keep[j] or not noise[j]
+    for i in list(range(min(3, n))) + list(range(max(0, n - 15), n)):  # how it started, how it ended
+        keep[i] = keep[i] or not noise[i]
+    out, gap, dropped = [], 0, 0
+    for i, ln in enumerate(lines):
+        if keep[i]:
+            if gap:
+                out.append(f"… {gap} lines …")
+                gap = 0
+            out.append(ln)
+        else:
+            gap += 1
+            dropped += noise[i]
+    if gap:
+        out.append(f"… {gap} lines …")
+    kept = "\n".join(out)
+    notes = [f"kept {sum(keep)} of {n} lines (errors, failures, warnings, summary); {dropped} passing/progress lines dropped"]
+    if tokens.count(kept) > budget:
+        kept = head_tail(kept, budget)
+        notes.append("cut to head and tail")
+    kept = f"[atr: {'; '.join(notes)}]\n{kept}"
+    return Result(text=kept, before=before, after=tokens.count(kept), lossy=True, notes=notes)

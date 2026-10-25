@@ -124,7 +124,7 @@ def test_server_hides_schemas_and_compresses_calls():
             assert len(srv.tools) == 50  # both pages of tools/list
             listed = (await srv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))["result"]["tools"]
             assert [t["name"] for t in listed] == ["atr_find_tools", "atr_read", "atr_call", "atr_query", "atr_read_file",
-                                                   "atr_repo_map", "atr_search_code", "atr_run", "atr_stats"]
+                                                   "atr_repo_map", "atr_search_code", "atr_diff", "atr_run", "atr_stats"]
             ann = {t["name"]: t["annotations"]["readOnlyHint"] for t in listed}
             assert [n for n, ro in ann.items() if not ro] == ["atr_call", "atr_run"]
             assert srv.stats["schema_exposed"] < srv.stats["schema_full"] / 5
@@ -156,7 +156,7 @@ def test_pinned_tools_are_exposed_directly():
         await srv.start()
         try:
             names = [t["name"] for t in srv.list_tools()]
-            assert "fake__github_create_issue" in names and len(names) == 10
+            assert "fake__github_create_issue" in names and len(names) == 11
             res = await srv.call("fake__github_create_issue", {"owner": "a", "repo": "b", "filter": "hi"})
             assert "number: 1001" in res["content"][0]["text"]
         finally:
@@ -217,6 +217,6 @@ def test_stdio_handshake():
     out = [json.loads(ln) for ln in p.stdout.splitlines()]
     assert out[0]["result"]["serverInfo"]["name"] == "atr"
     assert out[0]["result"]["protocolVersion"] == "2025-06-18"
-    assert len(out[1]["result"]["tools"]) == 9
+    assert len(out[1]["result"]["tools"]) == 10
     assert "Connected" not in out[1]["result"]["tools"][0]["description"]  # nothing connected, no line
 

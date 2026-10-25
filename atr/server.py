@@ -15,15 +15,17 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import fnmatch
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from atr import __version__, code, tokens
-from atr.compress import compress, head_tail
+from atr.compress import compress, compress_output, head_tail
 from atr.config import Config
 from atr.downstream import Downstream, log, make_downstream
 from atr.router import ToolIndex, signature, slim_schema, topics
@@ -61,13 +63,14 @@ OUTLINE = re.compile(r"^\s*(def |async def |class |function |export |public |pri
 RICH_DOCS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".doc", ".epub"}
 
 INSTRUCTIONS = (
-    "Tools from connected servers are hidden to save tokens. To use one: atr_find_tools with a short "
-    "task description, then atr_read for tools it marks [r] (read-only) or atr_call for tools marked [w] "
-    "(they change something and may ask the user for approval). Large results come back summarized "
-    "with a ref; use atr_query on that ref to filter or page through the full data instead of calling the "
-    "tool again. Prefer atr_read_file over pasting files. For code questions, go cheapest first: "
-    "atr_search_code (with context=3 to see surrounding lines) or a ranking tool from atr_find_tools, then "
-    "atr_read_file with lines= or search= for just the part you need. Avoid reading whole files.")
+    "ATR saves tokens. Coding: run tests, builds, installs and linters with atr_run (failures, errors and the "
+    "summary are kept; passing tests and progress lines are dropped), see changes with atr_diff instead of "
+    "`git diff`, find code with atr_search_code (context=3 often answers without opening the file), and read "
+    "with atr_read_file using lines= or search= rather than whole files. Re-reading a file you already read "
+    "returns 'unchanged' or only the changed lines; pass fresh=true if you no longer have it. "
+    "Tools from connected servers are hidden: atr_find_tools with a short task description, then atr_read "
+    "for tools marked [r] (read-only) or atr_call for [w] (they change something and may need approval). "
+    "Large results come back summarized with a ref; use atr_query on the ref instead of calling the tool again.")
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 CALL_SCHEMA = {"type": "object", "properties": {
@@ -115,6 +118,7 @@ META_TOOLS = [
          "lines": {"type": "string", "description": "Line range, e.g. 120-180."},
          "search": {"type": "string", "description": "Regex: only matching lines, with line numbers."},
          "context": {"type": "integer", "description": "Lines around each search match (default 0)."},
+         "fresh": {"type": "boolean", "description": "Send the full text even if you read it before."},
          "budget": {"type": "integer"}},
          "required": ["path"]},
      "annotations": READ_ONLY},
@@ -135,6 +139,16 @@ META_TOOLS = [
          "budget": {"type": "integer"}},
          "required": ["pattern"]},
      "annotations": READ_ONLY},
+    {"name": "atr_diff",
+     "description": "What changed, compactly: git diff with 1 line of context, lockfiles/generated/binary files "
+                    "listed but not shown. Default: uncommitted changes. Use instead of `git diff`.",
+     "inputSchema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "Folder inside the repo (default: the project)."},
+         "ref": {"type": "string", "description": "Compare with this commit/branch, e.g. main or HEAD~1."},
+         "staged": {"type": "boolean", "description": "Only staged changes."},
+         "file": {"type": "string", "description": "Only this file (path from the repo root)."},
+         "budget": {"type": "integer"}}},
+     "annotations": READ_ONLY},
     {"name": "atr_run",
      "description": "Run a shell command (tests, build, lint) and get compressed output: failures kept, noise cut.",
      "inputSchema": {"type": "object", "properties": {
@@ -150,8 +164,8 @@ META_TOOLS = [
 ]
 
 
-FILE_TOOLS = {"atr_read_file", "atr_repo_map", "atr_search_code"}
-CODE_TOOLS = {"atr_repo_map", "atr_search_code", "atr_run"}
+FILE_TOOLS = {"atr_read_file", "atr_repo_map", "atr_search_code", "atr_diff"}
+CODE_TOOLS = {"atr_repo_map", "atr_search_code", "atr_diff", "atr_run"}
 
 
 def text_result(text: str, is_error: bool = False) -> dict:
@@ -165,6 +179,7 @@ class ATRServer:
         self.tools: dict[str, tuple[Downstream, dict]] = {}  # exposed name -> (server, tool definition)
         self.index = ToolIndex({})
         self.stash = Stash()
+        self.reads: dict[tuple, str] = {}  # what atr_read_file already showed this session
         self.ready = asyncio.Event()
         self.out_lock = asyncio.Lock()
         self.stats = {"results_before": 0, "results_after": 0, "calls": 0, "stashed": 0,
@@ -328,7 +343,37 @@ class ATRServer:
         return p
 
     def read_file(self, path: str, search: str | None, budget: int | None, lines: str | None = None,
-                  context: int = 0) -> dict:
+                  context: int = 0, fresh: bool = False) -> dict:
+        """atr_read_file, remembering what this session already read: the same read again returns
+        "unchanged", and a file that changed since returns only the changed lines."""
+        stats = dict(self.stats)
+        res = self._read_file(path, search, budget, lines, context)
+        if res.get("isError"):
+            return res
+        key = (str(self.resolve(path)), lines or "", search or "", context)
+        text = res["content"][0]["text"]
+        shown = re.sub(r"\br\d+\b", "r#", text)  # stash refs differ between reads of the same thing
+        prev = self.reads.get(key)
+        self.reads[key] = shown
+        if fresh or prev is None:
+            return res
+        if prev == shown:
+            note = (f"[atr: {Path(key[0]).name} is unchanged since you read it earlier in this session (same "
+                    f"{'lines' if lines else 'search' if search else 'read'}). Pass fresh=true if you no longer have it.]")
+        else:
+            diff = [ln for ln in difflib.unified_diff(prev.splitlines(), shown.splitlines(), lineterm="", n=1)
+                    if not ln.startswith(("---", "+++"))]
+            note = (f"[atr: {Path(key[0]).name} changed since you last read it. Only the changes ('-' old, '+' new); "
+                    f"pass fresh=true for the full text.]\n" + "\n".join(diff))
+            if tokens.count(note) * 2 > tokens.count(text):  # most of it changed: just send it
+                return res
+        # count it as the read it replaced, not a second full read
+        self.stats.update({k: stats[k] for k in ("results_before", "results_after", "calls")})
+        self._count(tokens.count(text), tokens.count(note))
+        return text_result(note)
+
+    def _read_file(self, path: str, search: str | None, budget: int | None, lines: str | None = None,
+                   context: int = 0) -> dict:
         budget = budget or self.cfg.budget
         try:
             p = self.resolve(path)
@@ -419,11 +464,19 @@ class ATRServer:
                                      context=min(int(a.get("context") or 0), 10))
             self._count(tokens.count(text), tokens.count(text))  # no fair baseline: counted as neutral
             return text_result(text)
+        if name == "atr_diff":
+            try:
+                text, plain = await asyncio.to_thread(code.git_diff, root, a.get("ref"), bool(a.get("staged")),
+                                                      a.get("file"), budget)
+            except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                return text_result(f"atr_diff: {e}", True)
+            self._count(max(plain, tokens.count(text)), tokens.count(text))  # vs. a plain `git diff`
+            return text_result(text)
         if not self.allow_run:
             return text_result("atr_run is off on this server (start it with --allow-run to allow).", True)
         timeout = float(a.get("timeout") or self.cfg.run_timeout)
         rc, out, secs = await code.run(a.get("command", ""), root, timeout)
-        r = compress(out or "(no output)", budget=budget, level=self.cfg.level)
+        r = compress_output(out or "(no output)", budget=budget, level=self.cfg.level)
         status = f"timed out after {timeout:.0f}s" if rc is None else f"exit {rc}"
         text = f"{status} · {secs:.1f}s · {len(out.splitlines())} lines of output\n{r.text}"
         if r.lossy:
@@ -477,8 +530,8 @@ class ATRServer:
             return text_result(f"{name} is off on this server (start it with --read-files to allow).", True)
         if name == "atr_read_file":
             return self.read_file(a.get("path", ""), a.get("search"), a.get("budget"), a.get("lines"),
-                                  int(a.get("context") or 0))
-        if name in ("atr_repo_map", "atr_search_code", "atr_run"):
+                                  int(a.get("context") or 0), bool(a.get("fresh")))
+        if name in ("atr_repo_map", "atr_search_code", "atr_diff", "atr_run"):
             return await self.code_tool(name, a)
         if name == "atr_stats":
             await self.ready.wait()
