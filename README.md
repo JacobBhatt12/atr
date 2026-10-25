@@ -34,14 +34,14 @@ From `python -m benchmarks.bench_atr`, using the tiktoken `cl100k` tokenizer. Th
 
 **In a real coding agent the gain is smaller.** Claude Code and Codex already trim their own commands (`| tail -60`, `git diff --stat`). In a live Claude Code test (review a change, find why 3 of 306 tests fail), both runs used about 50k input tokens, with or without ATR. For coders, ATR pays off on the MCP servers you plug in (GitHub, browsers, databases, logs), whose results the agent gets in full.
 
-**Playwright, live** (open Hacker News, click "new", open a GitHub issues page; same answers every time; one run each, and runs vary a lot):
+**Playwright, live** (open Hacker News, click "new", open a GitHub issues page). ATR v0.2.1, 3 runs each, all answers correct; medians, with each run in brackets:
 
 | Agent | Without ATR | With ATR |
 |---|---|---|
-| Codex | 173.5k input tokens, 27.6k of them uncached | 145.2k (**−16%**), 13.1k uncached (**−52%**) |
-| Claude Code (Sonnet) | $0.235, then $0.067 on a second run | $0.229, then $0.191 |
+| Claude Code (Sonnet) | **$0.237** [0.244, 0.207, 0.237] · 401k input · 13 turns | **$0.110** [0.158, 0.108, 0.110] · 213k input · 10 turns: **54% cheaper** |
+| Codex | 84k input [120k, 84k, 84k] · 33k uncached [40k, 33k, 10k] | 134k input [134k, 148k, 117k] · 18k uncached [18k, 21k, 18k] |
 
-Codex gets every page snapshot in full, so ATR's snapshot compaction helps. Claude Code already loads MCP tools only when needed and saves huge results to a file, and in its cheaper run it skipped snapshots and ran small scripts in the page instead. Behind ATR it went back to snapshots and took more turns, so for Playwright in Claude Code, ATR doesn't help yet.
+In Claude Code, ATR's four core tools load up front (no tool-search turn), and its tool search names every tool on the server, so the model goes straight to page scripts (`browser_evaluate`) instead of reading full snapshots. Codex is mixed: with ATR it sends about half as many new (uncached) tokens but more in total, because it takes an extra step to find the tools; without ATR it already used page scripts in 2 of 3 runs.
 
 Compression runs locally in 1–270 ms. It doesn't call a model or the network.
 
