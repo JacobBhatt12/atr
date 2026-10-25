@@ -3,18 +3,26 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vrtx"
-version = "0.5.0"
-description = "A distributed GPU cloud with its own LLM inference engine"
+name = "atr"
+version = "0.1.0"
+description = "ATR: Automation for Token Reduction. An MCP proxy that hides tool schemas and compresses tool results."
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
-# The CLI and the cloud need only these; the engine's (torch, transformers, ...) are in requirements.txt.
-dependencies = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "httpx>=0.27", "pydantic>=2.6", "pyyaml>=6"]
+# ATR itself needs nothing outside the standard library.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/JacobBhatt12/atr"
+
+[project.optional-dependencies]
+exact = ["tiktoken>=0.7"]                # exact token counts instead of the chars/4 estimate
+docs = ["markitdown[all]>=0.1"]          # PDF / Word / PowerPoint / Excel in atr_read_file
+http = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "httpx>=0.27"]   # `atr serve --http` and HTTP downstream servers
+dev = ["pytest>=8.0"]
 
 [project.scripts]
-vrtx = "cli.vrtx:main"
+atr = "atr.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["engine*", "gateway*", "cloud*", "cli*"]
-
-[tool.setuptools.package-data]
-"cloud.builder" = ["*.Dockerfile"]
+include = ["atr*"]

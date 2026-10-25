@@ -1,1112 +1,255 @@
-# VRTX
+# ATR: Automation for Token Reduction
 
-**A distributed GPU cloud with its own LLM inference engine.**
+**Make any AI do the same work with far fewer tokens, so a free plan goes much further and a paid plan rarely hits its limits.**
 
-VRTX is three systems that work as one:
+ATR is an MCP server that sits between your AI app and your other tools. The AI connects to ATR only, and ATR runs your real MCP servers behind it. Two things eat most of the tokens in tool-using chats, and ATR goes after both:
 
-| Part | What it is | Real-world equivalent |
+| Bloat | What happens without ATR | What ATR does |
 |---|---|---|
-| **VRTX Engine** | Serves open-source LLMs (Qwen, Llama, Mistral) as fast as possible on a GPU | vLLM, NVIDIA TensorRT-LLM, SGLang |
-| **VRTX Cloud** | Deploys, schedules, routes and autoscales models and apps across machines | AWS Bedrock, Heroku, Vercel, Kubernetes |
-| **VRTX Ops** | An AI that reads crash logs and metrics and explains what broke, running on VRTX Engine itself | Datadog, PagerDuty, AWS DevOps Guru |
+| **Schema bloat** | Every connected tool's full definition is sent on *every* turn, whether it gets used or not | Shows the AI 5 small tools. It finds the one it needs with `atr_find_tools` |
+| **Response bloat** | A tool returns 400k tokens of raw JSON and all of it goes into the chat | Compresses every result to fit a budget, keeps the full result on the server, and lets the AI query it |
 
-Owner: Jacob Bhatt ([@JacobBhatt12](https://github.com/JacobBhatt12))
-Started: June 2026
-Target: ~9 months
-Budget: $0
+Owner: Jacob Bhatt ([@JacobBhatt12](https://github.com/JacobBhatt12)) · Started: October 2026 · Budget: $0
 
 ---
 
-## Table of contents
+## Measured savings
 
-1. [The pitch](#1-the-pitch)
-2. [What we are using](#2-what-we-are-using-tech-stack)
-3. [System wireframe](#3-system-wireframe)
-4. [Request lifecycle](#4-request-lifecycle)
-5. [VRTX Engine in depth](#5-vrtx-engine-in-depth)
-6. [VRTX Cloud in depth](#6-vrtx-cloud-in-depth)
-7. [VRTX Ops in depth](#7-vrtx-ops-in-depth)
-8. [API design](#8-api-design)
-9. [Dashboard wireframes](#9-dashboard-wireframes)
-10. [CLI wireframe](#10-cli-wireframe)
-11. [Repo structure](#11-repo-structure)
-12. [Build plan, month by month](#12-build-plan-month-by-month)
-13. [Free compute plan](#13-free-compute-plan)
-14. [Benchmarking plan](#14-benchmarking-plan)
-15. [The math cheat sheet](#15-the-math-cheat-sheet)
-16. [Risks and how we handle them](#16-risks-and-how-we-handle-them)
-17. [What "done" looks like](#17-what-done-looks-like)
-18. [Getting started today](#18-getting-started-today)
-19. [Reading list](#19-reading-list)
+From `python -m benchmarks.bench_atr`, using the tiktoken `cl100k` tokenizer. The test server has 50 tools and returns results shaped like real ones (GitHub REST payloads, service logs, web pages). The raw numbers are in `benchmarks/results/atr_*.json`.
+
+| Scenario | Before | After | Saved |
+|---|---:|---:|---:|
+| 50 tool schemas, paid on every turn | 11,256 | 541 | **95.2%** (+134 per `atr_find_tools` call) |
+| 1,000 GitHub issues (JSON), 1,500-token budget | 429,203 | 879 | **99.8%** (the rest is kept for `atr_query`) |
+| 30 GitHub issues, nothing cut | 12,878 | 3,448 | **73.2%** |
+| 2,000-line service log, 600-token budget | 61,072 | 206 | **99.7%** (the error and traceback are kept) |
+| Fetched web page (HTML) | 930 | 350 | **62.4%** |
+
+Compression runs locally in 1–270 ms. It doesn't call a model or the network.
 
 ---
 
-## 1. The pitch
+## How it works
 
-Every AI company has the same expensive problem: GPUs cost a fortune and most of that power gets wasted. Generating a single token means reading every weight of the model from GPU memory, so a GPU serving one user sits mostly idle. The companies that win (NVIDIA, AWS, OpenAI, Together AI) are the ones that squeeze the most users onto each GPU and scale them across a fleet without anything falling over.
+```
+ Claude Desktop / Claude Code / Cursor / Zed / VS Code
+            │   sees 5 ATR tools (~540 tokens) instead of every schema (~11,000+)
+            ▼
+ ┌────────────────────────────── ATR ──────────────────────────────┐
+ │ atr_find_tools  BM25 search over all tool names/descriptions →   │
+ │                 3–5 one-line signatures: create_issue(owner*:str…)│
+ │ atr_read        run a read-only tool → compress → stash          │
+ │ atr_call        run a tool that changes things (same pipeline)   │
+ │ atr_query       filter / pick fields / search / group / page a   │
+ │                 stashed result: only the slice enters the chat   │
+ │ atr_read_file   local file as compact text; outline for big code │
+ │ atr_stats       tokens saved so far                              │
+ └──────────────────────────────────────────────────────────────────┘
+            │   spawns and talks to them exactly like your client would
+            ▼
+   github · postgres · slack · filesystem · … (unchanged)
+```
 
-VRTX attacks that problem from the bottom of the stack to the top:
+**What compression does** (`atr/compress.py`), from safest to most aggressive:
 
-- **The bottom:** custom GPU kernels, a paged memory system for the KV cache, continuous batching, quantization and speculative decoding.
-- **The middle:** a fault-tolerant control plane (Raft), a bin-packing scheduler, and a queueing-theory autoscaler.
-- **The top:** an OpenAI-compatible API, a web dashboard, a CLI, and an AI ops agent that uses the platform's own model to debug the platform.
+1. Parses JSON (or JSON lines) that tools return as text.
+2. Drops `null`, empty values and noise keys (`_links`, `etag`, `node_id`, …).
+3. Writes data as `key: value` lines instead of quoted, braced JSON.
+4. Turns lists of similar objects into one CSV table. Nested fields are flattened (`user.login`). A column that has the same value in every row is written once in the header (`all rows: state=open`).
+5. Converts HTML to text, strips ANSI colors, and collapses repeated log lines: `… 1959 similar lines …`.
+6. Drops `structuredContent` when it repeats the text content, which many servers send both ways.
+7. When there's a budget, it shortens long strings, samples big tables, and keeps the head and tail of long text (that's where errors usually are). Anything cut is marked in the output, and the full result is stashed under a ref like `r3`.
 
-**Resume line when done:**
+The model can then ask for exactly what it needs:
 
-> Built VRTX, a distributed GPU cloud with a custom LLM inference engine (Triton kernels, paged KV cache, continuous batching, speculative decoding) serving X tokens/sec across Y concurrent users, with a Raft-replicated control plane and an Erlang-C autoscaler.
+```
+atr_query(ref="r3", where=["state=open", "comments>5"], fields=["number","title","user.login"])
+atr_query(ref="r3", group_by="state")            → {"open": 685, "closed": 315}
+atr_query(ref="r4", search="ERROR|Traceback")     → matching lines only, with line numbers
+```
+
+This is the "code execution" pattern: the full data stays out of the context window, and the model reads only a summary or a slice.
 
 ---
 
-## 2. What we are using (tech stack)
+## Try it in one minute
 
-Everything here is free and open source.
-
-### Core languages
-
-| Tool | Used for |
-|---|---|
-| **Python 3.11+** | Engine, gateway, control plane, ops (one language keeps the project moving) |
-| **Triton** | Custom GPU kernels (OpenAI's GPU language, written in Python) |
-| **TypeScript** | Dashboard |
-| **Go** (stretch) | Optional rewrite of the worker agent or Raft for speed and range |
-
-### AI and GPU
-
-| Tool | Used for |
-|---|---|
-| **PyTorch** | Tensor math, running the model layers |
-| **Hugging Face `transformers` + `safetensors`** | Downloading and loading model weights; also the "naive baseline" we benchmark against |
-| **Open-weight models** | Qwen 2.5 (0.5B to 7B), Llama 3, Mistral 7B, Gemma. |
-| **vLLM** | Not part of VRTX. Only used as the "pro" benchmark to compare against |
-
-### Backend and APIs
-
-| Tool | Used for |
-|---|---|
-| **FastAPI** | REST API for the gateway and the control plane |
-| **Uvicorn** | ASGI server that runs FastAPI |
-| **Pydantic** | Request and response validation |
-| **Server-Sent Events + WebSockets** | Streaming tokens to clients, live logs to the dashboard |
-| **httpx** | Async HTTP between services |
-| **gRPC** (stretch) | Faster internal calls between control plane and workers |
-
-### Cloud and infrastructure
-
-| Tool | Used for |
-|---|---|
-| **Docker** | Running user apps and model replicas in containers |
-| **Linux namespaces and cgroups** | Isolation and resource limits (what Docker uses under the hood) |
-| **Firecracker** (stretch) | MicroVMs, what AWS Lambda uses |
-| **SQLite** | Each control plane node's state machine (driven by the Raft log) |
-| **Prometheus text format** | Metrics endpoint on every service |
-
-### Frontend
-
-| Tool | Used for |
-|---|---|
-| **Next.js + React** | VRTX dashboard |
-| **Tailwind CSS** | Styling |
-| **Recharts** | Live charts (tokens/sec, latency, GPU memory) |
-
-### Testing and tooling
-
-| Tool | Used for |
-|---|---|
-| **pytest** | Unit and integration tests |
-| **Locust or k6** | Load testing (simulate hundreds of users) |
-| **GitHub Actions** | CI: run tests on every push |
-| **Typer** | The `vrtx` command-line tool |
-
----
-
-## 3. System wireframe
-
-```
-                         +-------------------------------+
-                         |        USERS AND APPS         |
-                         |  chat apps, curl, OpenAI SDK, |
-                         |  vrtx CLI, web dashboard      |
-                         +---------------+---------------+
-                                         |
-                                  HTTPS  |  REST + SSE + WebSocket
-                                         v
-+--------------------------------------------------------------------------+
-|                              VRTX GATEWAY                                |
-|                               (FastAPI)                                  |
-|                                                                          |
-|   +-------------+   +----------------+   +------------------------+     |
-|   | Auth        |   | Rate limiter   |   | Router                 |     |
-|   | API keys    |-->| token bucket   |-->| consistent hashing on  |     |
-|   |             |   | per key        |   | prompt prefix          |     |
-|   +-------------+   +----------------+   +-----------+------------+     |
-|                                                       |                  |
-|   +-----------------------+                           |                  |
-|   | Usage metering        |                           |                  |
-|   | tokens per key        |                           |                  |
-|   +-----------------------+                           |                  |
-+-------------------------------------------------------+------------------+
-                     ^                                  |
-       routing table |                                  | forwards request
-                     |                                  v
-+--------------------+--------------+    +-------------------------------------+
-|        CONTROL PLANE (x3)         |    |          GPU WORKER NODES           |
-|                                   |    |                                     |
-|  +-----------------------------+  |    |  +-------------------------------+  |
-|  | Raft consensus              |  |    |  | Worker agent                  |  |
-|  | leader election, log repl.  |  |    |  | starts/stops containers,      |  |
-|  +-----------------------------+  |    |  | reports health + GPU memory   |  |
-|  | API server (FastAPI)        |  |<---+  +-------------------------------+  |
-|  | deployments, keys, nodes    |  |    |                                     |
-|  +-----------------------------+  |    |  +---------------+ +-------------+  |
-|  | Scheduler                   |  |--->|  | VRTX ENGINE   | | APP         |  |
-|  | bin packing onto GPUs       |  |    |  | replica       | | CONTAINERS  |  |
-|  +-----------------------------+  |    |  |               | |             |  |
-|  | Autoscaler                  |  |    |  | scheduler     | | user code   |  |
-|  | Erlang C + forecasting      |  |    |  | paged KV      | | from        |  |
-|  +-----------------------------+  |    |  | Triton kernels| | git push    |  |
-|  | Builder                     |  |    |  | spec decoding | |             |  |
-|  | git push -> container image |  |    |  +-------+-------+ +-------------+  |
-|  +-----------------------------+  |    |          |                          |
-+-----------------+-----------------+    +----------+--------------------------+
-                  |                                 |
-                  | metrics + logs                  | metrics + logs
-                  v                                 v
-+--------------------------------------------------------------------------+
-|                                VRTX OPS                                  |
-|                                                                          |
-|   +----------------+   +--------------------+   +---------------------+  |
-|   | Collector      |   | Anomaly detection  |   | AI debugger         |  |
-|   | logs, metrics, |-->| z-scores, log      |-->| sends logs to VRTX  |  |
-|   | traces         |   | clustering         |   | Engine, gets fix    |  |
-|   +----------------+   +--------------------+   +----------+----------+  |
-+------------------------------------------------------------+-------------+
-                                                             |
-                                                             v
-                                              +-----------------------------+
-                                              |  DASHBOARD (Next.js)        |
-                                              |  incidents, charts, deploys |
-                                              +-----------------------------+
-```
-
-**Key idea:** the AI debugger in VRTX Ops calls VRTX Engine to explain failures. The platform debugs itself with its own model.
-
----
-
-## 4. Request lifecycle
-
-What happens when someone sends one chat message:
-
-```
-Client          Gateway             Control plane        Worker / Engine
-  |                |                      |                     |
-  |-- POST ------->|                      |                     |
-  |  /v1/chat/     | 1. check API key     |                     |
-  |  completions   | 2. token bucket      |                     |
-  |                | 3. hash prompt       |                     |
-  |                |    prefix, look up   |                     |
-  |                |    routing table  <--| (pushed on change)  |
-  |                |                      |                     |
-  |                |-- forward ---------------------------------->|
-  |                |                      |   4. tokenize        |
-  |                |                      |   5. join next batch |
-  |                |                      |   6. prefill prompt  |
-  |                |                      |      (reuse cached   |
-  |                |                      |       prefix blocks) |
-  |                |                      |   7. decode loop:    |
-  |<== token ======|<=========================  one token per    |
-  |<== token ======|<=========================  forward pass,     |
-  |<== token ======|<=========================  streamed via SSE  |
-  |                |                      |                     |
-  |<== [DONE] =====|<========================= 8. free KV blocks |
-  |                | 9. meter tokens      |                     |
-  |                |                      |<-- 10. metrics -----|
-  |                |                      |  autoscaler decides |
-  |                |                      |  if more replicas   |
-  |                |                      |  are needed         |
-```
-
----
-
-## 5. VRTX Engine in depth
-
-### 5.1 The core insight: decoding is memory-bound
-
-To generate one token, the GPU must read every weight in the model. So for one user:
-
-```
-max tokens/sec  ~=  memory bandwidth / model size in bytes
-```
-
-Example: Llama 3 8B in fp16 is ~16 GB. An RTX 4090 has ~1 TB/s of bandwidth. Ceiling: ~60 tokens/sec for a single user, no matter how fast the math units are. A T4 (320 GB/s) running Qwen 2.5 0.5B (~1 GB in fp16) has a ceiling around 300 tokens/sec.
-
-If we serve **B** users in the same forward pass, we read the weights once and do B times the math. Arithmetic intensity (FLOPs per byte read) grows roughly with B. Under the **roofline model**, the GPU only becomes compute-bound once:
-
-```
-B  >  peak FLOPs / memory bandwidth      (the "ridge point")
-```
-
-That is in the low hundreds for most GPUs. **The whole engine is a machine for making B as large as possible without running out of memory.**
-
-### 5.2 Engine architecture
-
-```
-                    +--------------------------------------------+
-  requests -------> |              REQUEST QUEUE                 |
-                    +----------------------+---------------------+
-                                           |
-                                           v
-                    +--------------------------------------------+
-                    |                SCHEDULER                   |
-                    |  every iteration:                          |
-                    |   - remove finished sequences              |
-                    |   - admit waiting sequences if KV fits     |
-                    |   - split prefill into chunks              |
-                    |   - preempt (swap or recompute) if full    |
-                    +----------+--------------------+------------+
-                               |                    |
-                               v                    v
-               +---------------------+   +-------------------------+
-               |  KV CACHE MANAGER   |   |      MODEL RUNNER       |
-               |  block allocator    |   |  embeddings             |
-               |  block tables       |<->|  N x [RMSNorm, attention|
-               |  prefix hash cache  |   |       (Triton), MLP]    |
-               |  copy-on-write      |   |  LM head -> logits      |
-               +---------------------+   +------------+------------+
-                                                      |
-                                                      v
-                                         +-------------------------+
-                                         |        SAMPLER          |
-                                         |  temperature, top-k,    |
-                                         |  top-p, spec decoding   |
-                                         +------------+------------+
-                                                      |
-                                                      v
-                                              stream tokens out
-```
-
-### 5.3 Continuous batching
-
-Naive batching waits for every request in a batch to finish before starting new ones, so short replies sit idle waiting on long ones. VRTX does **iteration-level scheduling**: after every forward pass, finished sequences leave and waiting ones join.
-
-Two phases with very different costs:
-
-- **Prefill** (process the whole prompt at once): compute-heavy. Cost ~ `2 x params x prompt_length` FLOPs, plus attention that grows with `n^2`.
-- **Decode** (one token at a time): memory-heavy.
-
-Long prompts get **chunked** (for example 512 tokens per step) so one giant prompt can't freeze everyone else's stream.
-
-### 5.4 KV cache memory math
-
-Every token in context stores a key and a value vector in every layer:
-
-```
-KV bytes per token = 2 x layers x kv_heads x head_dim x bytes_per_value
-```
-
-| Model | Layers | KV heads | Head dim | fp16 KV per token |
-|---|---|---|---|---|
-| Qwen 2.5 0.5B | 24 | 2 | 64 | 12 KB |
-| Llama 3 8B | 32 | 8 | 128 | 128 KB |
-
-An 8K-token conversation on Llama 3 8B uses ~1 GB of KV cache. **That is what limits batch size.**
-
-### 5.5 Paged attention
-
-Instead of reserving max-context memory for every request up front, split the KV cache into fixed-size **blocks** (for example 16 tokens each), just like an operating system splits RAM into pages.
-
-```
-Sequence A block table:  [ 7 ][ 2 ][ 9 ]        Physical GPU blocks
-Sequence B block table:  [ 7 ][ 4 ]             +---+---+---+---+---+---+---+---+---+---+
-                           ^                    | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
-                           |                    +---+---+---+---+---+---+---+---+---+---+
-              shared prefix block (refcount 2)        A       B           A,B     A
-```
-
-- Waste per sequence drops to **less than one block**.
-- **Prefix caching:** hash each full block of token IDs. If 500 users share a system prompt, its blocks are stored once with a reference count.
-- **Copy-on-write:** when a shared block needs to change, copy it first.
-- **Eviction:** when memory is full, either swap blocks to CPU RAM or drop and recompute later. Pick whichever is cheaper:
-
-```
-swap cost      ~= bytes / PCIe bandwidth   (x2: out and back in)
-recompute cost ~= prefill FLOPs / GPU FLOPs
-```
-
-### 5.6 Custom Triton kernels
-
-| Kernel | Why |
-|---|---|
-| **Flash-style attention** | Never materializes the full `n x n` attention matrix. Memory goes from O(n^2) to O(n) |
-| **Paged attention (decode)** | Reads K and V directly through the block table |
-| **Fused RMSNorm** | One kernel instead of several, fewer memory round trips |
-| **Fused rotary embeddings (RoPE)** | Same reason |
-| **Int8 / int4 dequant + matmul** | Read small weights, expand them on chip |
-
-The trick behind flash attention is the **online softmax**. Process scores in tiles. Keep a running max `m`, running sum `l`, and running output `o`. For each new tile of scores `x` with values `V_tile`:
-
-```
-m_new = max(m, max(x))
-l_new = l * e^(m - m_new) + sum(e^(x - m_new))
-o_new = o * e^(m - m_new) + sum(e^(x - m_new) * V_tile)
-final output = o / l
-```
-
-Every kernel gets a correctness test against PyTorch and a speed benchmark.
-
-### 5.7 Quantization
-
-Symmetric quantization with group size `g`:
-
-```
-int8:  scale s = max|w| / 127      q = round(w / s)      w ~= q x s
-int4:  scale s = max|w| / 7        (two values packed per byte)
-```
-
-Rounding error is roughly uniform on `[-s/2, s/2]`, so its variance is `s^2 / 12`. Smaller groups mean smaller `s` and less error, but more scales to store. We measure the tradeoff with a **perplexity vs. memory** chart. Halving the bytes roughly doubles the decode ceiling from 5.1.
-
-### 5.8 Speculative decoding
-
-A small **draft** model (for example Qwen 2.5 0.5B) guesses `gamma` tokens. The big **target** model (for example Qwen 2.5 7B) checks all of them in one forward pass.
-
-If each guess is accepted with probability `alpha`:
-
-```
-expected tokens per target pass = (1 - alpha^(gamma + 1)) / (1 - alpha)
-```
-
-Acceptance rule (keeps the output distribution **exactly** the same as the target model alone):
-
-```
-accept draft token x with probability  min(1, p(x) / q(x))
-on rejection, sample from  normalize(max(0, p - q))
-```
-
-where `p` is the target's distribution and `q` is the draft's. VRTX tunes `gamma` live from the observed acceptance rate.
-
-### 5.9 Sampling
-
-Implemented by hand (already in `engine/sampling.py`):
-
-- **Temperature:** divide logits by `T`
-- **Top-k:** keep the `k` most likely tokens
-- **Top-p (nucleus):** keep the smallest set whose probabilities sum to at least `p`
-
----
-
-## 6. VRTX Cloud in depth
-
-### 6.1 Components
-
-```
-+------------------------- CONTROL PLANE NODE (x3) --------------------------+
-|                                                                            |
-|  FastAPI API  -->  propose change  -->  RAFT LOG  -->  commit on majority  |
-|                                            |                               |
-|                                            v                               |
-|                               STATE MACHINE (SQLite)                       |
-|                  deployments | replicas | nodes | api keys | builds        |
-|                                            |                               |
-|            +-------------------------------+---------------------+         |
-|            v                               v                     v         |
-|       SCHEDULER                       AUTOSCALER              BUILDER      |
-|   (where replicas go)          (how many replicas)      (git -> image)     |
-+----------------------------------------------------------------------------+
-```
-
-Only the **leader** runs the scheduler and autoscaler. If it dies, a new leader is elected and picks up from the replicated log.
-
-### 6.2 Raft consensus
-
-- **Leader election:** followers wait a randomized timeout (for example 150 to 300 ms). If no heartbeat arrives, they become candidates and request votes. Randomization prevents split votes.
-- **Log replication:** the leader appends commands and sends them to followers.
-- **Commit rule:** an entry is committed once a majority has it:
-
-```
-majority = floor(n / 2) + 1        3 nodes -> 2,  5 nodes -> 3
-```
-
-- **Safety:** a node only votes for a candidate whose log is at least as up to date as its own.
-
-**Demo moment:** kill the leader in the middle of a deploy and watch the cluster elect a new one and finish the deploy.
-
-### 6.3 Scheduling is bin packing
-
-Each node has capacity in several dimensions: GPU memory, CPU, RAM. Each replica needs some of each. Fitting them is **multi-dimensional bin packing**, which is NP-hard. We implement and compare:
-
-| Algorithm | Notes |
-|---|---|
-| First-Fit Decreasing | Sort by size, put each item in the first bin that fits. In 1D, uses at most `11/9 x OPT + 6/9` bins |
-| Best-Fit | Put each item where it leaves the least leftover space |
-| Scored heuristic | Weighted score of leftover GPU memory, fragmentation, and spreading replicas across nodes |
-| ILP solver (small clusters only) | Finds the true optimum, used to measure how close the heuristics get |
-
-### 6.4 Autoscaling with queueing theory
-
-Model each deployment as an **M/M/c queue**:
-
-- `lambda` = request arrival rate
-- `mu` = requests per second one replica can serve
-- `c` = number of replicas
-- `a = lambda / mu` (offered load), utilization `rho = a / c` (must be < 1)
-
-**Erlang C** gives the probability a request has to wait:
-
-```
-                 (a^c / c!) x (c / (c - a))
-C(c, a) = -----------------------------------------------
-           sum_{k=0}^{c-1} (a^k / k!)  +  (a^c / c!) x (c / (c - a))
-```
-
-Then:
-
-```
-expected wait      W_q = C(c, a) / (c x mu - lambda)
-tail of the wait   P(wait > t) = C(c, a) x e^(-(c x mu - lambda) x t)
-p99 wait           t_99 = ln(100 x C(c, a)) / (c x mu - lambda)     (when C > 0.01)
-```
-
-**The autoscaler picks the smallest `c` where predicted p99 latency is under the SLO.**
-
-Extras:
-
-- **Little's Law** `L = lambda x W` to sanity check predictions against live metrics.
-- **Holt-Winters forecasting** of `lambda` so we scale up **before** a spike.
-- **PID control with hysteresis** so replica counts don't flap:
-
-```
-u(t) = Kp x e(t) + Ki x integral(e) + Kd x de/dt
-```
-
-- **Scale to zero** when idle, plus cold-start tricks (keep weights in page cache, snapshot loaded models).
-
-### 6.5 Routing
-
-- **Consistent hashing** on the first N tokens of the prompt, with virtual nodes. Requests with the same system prompt land on the replica that already has it cached. Adding a replica only moves about `1/n` of keys.
-- **Power of two choices** as a comparison: pick two random replicas, send to the less loaded one. Max load drops from about `log n / log log n` to about `log log n`.
-- **Measure it:** prefix cache hit rate with consistent hashing vs. random routing.
-
-### 6.6 Deploying apps
-
-```
-vrtx deploy  -->  upload code  -->  builder makes Docker image
-             -->  scheduler picks node  -->  worker starts container
-             -->  gateway gives it a URL  -->  health checks  -->  live
-```
-
-- Isolation with namespaces and cgroups (Docker), stretch goal Firecracker.
-- Every app gets a URL like `myapp.vrtx.local`.
-- Rolling deploys: start new replica, health check, shift traffic, stop old one.
-
----
-
-## 7. VRTX Ops in depth
-
-```
-logs + metrics --> COLLECTOR --> ANOMALY DETECTION --> INCIDENT --> AI DEBUGGER --> dashboard
-                                   z-scores                          (VRTX Engine)
-                                   log clustering
-```
-
-- **Metric anomalies:** rolling z-score `z = (x - mean) / std` over a window. Alert when `|z| > 3`.
-- **Log clustering:** embed error messages, group similar ones so 10,000 identical errors become one incident.
-- **AI debugger:** builds a prompt from the stack trace, recent logs, recent deploys and metrics, sends it to a model served by VRTX Engine, and returns:
-  - what broke
-  - the likely cause
-  - a suggested fix
-- **First real feature:** a GPU spend guard that auto-stops idle replicas.
-
----
-
-## 8. API design
-
-### Inference API (OpenAI compatible)
-
-Any app that works with the OpenAI SDK can point at VRTX by changing the base URL.
-
-| Method | Path | What it does |
-|---|---|---|
-| POST | `/v1/chat/completions` | Chat. `stream: true` returns Server-Sent Events |
-| POST | `/v1/completions` | Raw text completion |
-| GET | `/v1/models` | List loaded models |
-| GET | `/health` | Liveness |
-| GET | `/metrics` | Prometheus metrics |
-
-### Control plane API
-
-| Method | Path | What it does |
-|---|---|---|
-| POST | `/api/deployments` | Create a model or app deployment |
-| GET | `/api/deployments` | List deployments |
-| PATCH | `/api/deployments/{id}` | Change replicas, SLO, model |
-| DELETE | `/api/deployments/{id}` | Tear down |
-| GET | `/api/nodes` | Nodes, capacity, health |
-| GET | `/api/cluster` | Raft leader, term, commit index |
-| POST | `/api/keys` | Create an API key |
-| GET | `/api/incidents` | Incidents from VRTX Ops |
-| WS | `/ws/logs/{deployment}` | Live log stream |
-| WS | `/ws/metrics` | Live metrics stream |
-
-### Example deployment spec
-
-```yaml
-name: qwen-chat
-type: model
-model: Qwen/Qwen2.5-7B-Instruct
-quantization: int8
-speculative:
-  draft: Qwen/Qwen2.5-0.5B-Instruct
-  gamma: auto
-scaling:
-  min_replicas: 0
-  max_replicas: 4
-  slo_p99_ms: 800
-resources:
-  gpu_memory_gb: 12
-```
-
----
-
-## 9. Dashboard wireframes
-
-### 9.1 Overview
-
-```
-+------------------------------------------------------------------------------+
-|  VRTX                       Overview  Deployments  Playground  Ops  Bench    |
-+------------------------------------------------------------------------------+
-|                                                                              |
-|  +--------------+  +--------------+  +--------------+  +--------------+      |
-|  | Tokens/sec   |  | Active users |  | p99 latency  |  | GPU memory   |      |
-|  |   1,842      |  |     126      |  |   640 ms     |  |   71%        |      |
-|  +--------------+  +--------------+  +--------------+  +--------------+      |
-|                                                                              |
-|  Throughput (last 15 min)                       Cluster                      |
-|  +------------------------------------+   +------------------------------+  |
-|  |          __/\__      /\            |   | Leader:  cp-2   term 14      |  |
-|  |   __/\__/      \____/  \___        |   | cp-1  follower   healthy     |  |
-|  |  /                          \__    |   | cp-2  LEADER     healthy     |  |
-|  +------------------------------------+   | cp-3  follower   healthy     |  |
-|                                           +------------------------------+  |
-|  Nodes                                                                       |
-|  +------------------------------------------------------------------------+ |
-|  | node      GPU      GPU mem            replicas   status                 | |
-|  | gpu-a     T4       [#######---] 70%   3          healthy                | |
-|  | gpu-b     T4       [####------] 40%   1          healthy                | |
-|  | cpu-1     none     n/a                2 apps     healthy                | |
-|  +------------------------------------------------------------------------+ |
-+------------------------------------------------------------------------------+
-```
-
-### 9.2 Deployments
-
-```
-+------------------------------------------------------------------------------+
-|  Deployments                                        [ + New deployment ]     |
-+------------------------------------------------------------------------------+
-|  name          type    model / image          replicas   p99     status      |
-|  qwen-chat     model   Qwen2.5-7B (int8)      3 / 4      612ms   running     |
-|  draft-small   model   Qwen2.5-0.5B           1 / 2      90ms    running     |
-|  todo-api      app     git: main@a1f3c        2 / 5      45ms    running     |
-|  docs-site     app     git: main@77b0e        0 / 2      n/a     scaled to 0 |
-+------------------------------------------------------------------------------+
-
-  qwen-chat
-  +----------------------------------+  +-----------------------------------+
-  | Replicas vs traffic              |  | Autoscaler decision log           |
-  |  lambda  ___/^^^\___             |  | 14:02  lambda=38/s  c: 2 -> 3     |
-  |  c       _|‾‾‾‾|_                |  |        predicted p99 910ms > SLO  |
-  |                                  |  | 14:09  forecast spike, c: 3 -> 4  |
-  +----------------------------------+  +-----------------------------------+
-  [ Scale ]  [ Logs ]  [ Edit spec ]  [ Delete ]
-```
-
-### 9.3 Playground
-
-```
-+------------------------------------------------------------------------------+
-|  Playground          model: [ qwen-chat v ]   temp [0.7]  top-p [0.9]        |
-+------------------------------------------------------------------------------+
-|  System: You are a helpful assistant.                                        |
-|  ------------------------------------------------------------------------    |
-|  You:   explain paged attention like I'm 5                                   |
-|  VRTX:  Imagine your toy box is split into little bins...|  (streaming)      |
-|                                                                              |
-|  +--------------------------------------------------------------+ [ Send ]   |
-|  | type a message                                               |            |
-|  +--------------------------------------------------------------+            |
-|  TTFT 84 ms   |   61 tok/s   |   prefix cache hit: yes   |   replica gpu-a/2 |
-+------------------------------------------------------------------------------+
-```
-
-### 9.4 Ops / incidents
-
-```
-+------------------------------------------------------------------------------+
-|  Ops                                                       3 open incidents  |
-+------------------------------------------------------------------------------+
-|  ! todo-api crash loop             14:21   412 similar log lines             |
-|  ! gpu-b memory spike  z = 4.2     14:18                                     |
-|  ~ qwen-chat p99 above SLO         14:02   resolved by autoscaler            |
-+------------------------------------------------------------------------------+
-|  todo-api crash loop                                                         |
-|  +------------------------------------------------------------------------+  |
-|  | AI diagnosis (via qwen-chat on VRTX Engine)                            |  |
-|  |                                                                        |  |
-|  | What broke: the app exits on startup with KeyError: 'DATABASE_URL'.    |  |
-|  | Likely cause: deploy a1f3c added a database but no env var was set.    |  |
-|  | Fix: vrtx env set todo-api DATABASE_URL=...  then redeploy.            |  |
-|  +------------------------------------------------------------------------+  |
-|  [ View logs ]  [ Roll back to 77b0e ]  [ Mark resolved ]                    |
-+------------------------------------------------------------------------------+
-```
-
-### 9.5 Benchmarks
-
-```
-+------------------------------------------------------------------------------+
-|  Benchmarks        GPU: [ T4 v ]   model: [ Qwen2.5-0.5B v ]                 |
-+------------------------------------------------------------------------------+
-|  Throughput vs concurrent users                                              |
-|  tok/s                                                                       |
-|   |                                 ___________ vLLM                         |
-|   |                        ________/____________ VRTX                        |
-|   |               ________/                                                  |
-|   |     _________/                                                           |
-|   |____/____________________________________________ HF naive               |
-|   +-------------------------------------------------------- users            |
-|                                                                              |
-|  Roofline                         | Spec decoding speedup vs gamma            |
-|  (achieved vs ridge point)        | (bars for gamma = 1..8)                   |
-+------------------------------------------------------------------------------+
-```
-
----
-
-## 10. CLI wireframe
-
-```
-$ vrtx login
-$ vrtx models deploy Qwen/Qwen2.5-7B-Instruct --name qwen-chat --quant int8 --slo 800ms
-  Scheduling on gpu-a ........ done
-  Loading weights (7.6 GB) ... done
-  Healthy at https://qwen-chat.vrtx.local/v1
-
-$ vrtx deploy ./todo-api
-  Building image ............. done (38s)
-  Live at https://todo-api.vrtx.local
-
-$ vrtx ps
-  NAME        TYPE   REPLICAS  P99    STATUS
-  qwen-chat   model  3/4       612ms  running
-  todo-api    app    2/5       45ms   running
-
-$ vrtx logs todo-api --follow
-$ vrtx explain todo-api        # asks VRTX Ops why it is failing
-$ vrtx cluster status          # Raft leader, term, node health
-$ vrtx bench qwen-chat --users 1,8,32,128
-```
-
----
-
-## 11. Repo structure
-
-```
-VRTX/
-├── README.md               <- this file
-├── requirements.txt
-├── .gitignore
-├── engine/                 VRTX Engine
-│   ├── sampling.py         temperature / top-k / top-p, batched (Month 1-2)
-│   ├── naive_engine.py     Month 1 baseline engine
-│   ├── model.py            our own forward pass; picks PyTorch or Triton per op (Month 2-3)
-│   ├── ops.py              PyTorch reference ops, incl. batched paged decode attention
-│   ├── batch.py            flat ragged batch + attention metadata for one step
-│   ├── scheduler.py        continuous batching, chunked prefill, recompute/swap preemption
-│   ├── kv_cache.py         paged KV blocks, prefix-cache hashing, copy-on-write, swap (Month 2-4)
-│   ├── llm_engine.py       the engine loop: schedule -> (draft) -> forward -> sample/verify
-│   ├── cuda_graphs.py      decode, draft and verify steps recorded once and replayed (padded static batches)
-│   ├── async_engine.py     background thread for the server
-│   ├── kernels/            Triton: RMSNorm, RoPE+cache, SiLU, paged attention, int8/int4 matmul (Month 3)
-│   ├── quant/              int8 / int4 group quantization (Month 3)
-│   └── speculative/        draft proposals, exact verify rule, adaptive gamma (Month 4)
-├── gateway/                FastAPI front door
-│   ├── server.py           OpenAI-compatible API (what a model replica runs)
-│   └── proxy.py            routes <name>.vrtx.local to healthy replicas, streaming (Month 5)
-├── cloud/                  VRTX Cloud
-│   ├── state.py            SQLite cluster state; every write is one apply(command) (Month 5, Raft-ready)
-│   ├── spec.py             deployment specs (vrtx.yaml), validation, engine env vars
-│   ├── up.py               control plane + agent + gateway in one process (`vrtx up`)
-│   ├── raft/               consensus (Month 6)
-│   ├── api/                control plane REST API + reconcile loop (Month 5)
-│   ├── scheduler/          placement.py: filter + spread (Month 5); bin packing (Month 6)
-│   ├── autoscaler/         Erlang C + forecasting (Month 7)
-│   ├── router/             consistent hashing (Month 7)
-│   ├── builder/            code folder -> Docker image or prepared folder, content-hash cache (Month 5)
-│   └── agent/              worker agent: Docker / process runtimes, health checks, heartbeats (Month 5)
-├── ops/                    VRTX Ops (Month 8)
-├── cli/                    `vrtx` command: up, deploy, models deploy, ps, logs, scale, rm, nodes (Month 5)
-├── examples/               todo-api (FastAPI) and hello-static, for `vrtx deploy`
-├── dashboard/              Next.js web UI (Month 8)
-├── benchmarks/
-│   ├── bench_naive.py      Month 1 baseline
-│   ├── bench_batching.py   throughput vs batch size (Month 2; --kernels / --quant for Month 3)
-│   ├── bench_kernels.py    each Triton kernel vs PyTorch + roofline data + ablation (Month 3)
-│   ├── bench_quant.py      perplexity vs memory vs speed (Month 3)
-│   ├── bench_prefix.py     shared system prompt, prefix caching on/off (Month 4)
-│   ├── bench_spec.py       speculative decoding speedup vs gamma (Month 4)
-│   ├── bench_serving.py    full workloads on VRTX, vLLM, naive HF (Month 4)
-│   ├── plots.py            every writeup chart -> docs/charts/
-│   └── results/            raw JSON from every run
-├── tests/
-├── docs/                   design notes, math derivations, blog drafts
-└── scripts/                kaggle_benchmark.ipynb: one Run All for every GPU number
-```
-
----
-
-## 12. Build plan, month by month
-
-Each month ends with something that runs and a number you can measure.
-
-### Phase 1: VRTX Engine (Months 1 to 4)
-
-**Month 1: Baseline and API**
-- [x] Project folder, README, starter code
-- [x] Run Qwen 2.5 0.5B with our own sampling loop (`engine/naive_engine.py`)
-- [x] OpenAI-compatible FastAPI server with streaming (`gateway/server.py`)
-- [x] Benchmark harness: time to first token, tokens/sec, latency percentiles
-- [x] Load test with 1, 8, 32 users and record how badly the naive engine does
-- [x] Push to GitHub, set up GitHub Actions running pytest
-- **Milestone number:** baseline tokens/sec on a T4: **35.3 tok/s** (Hugging Face `model.generate`, one request at a time, fp16)
-
-**Month 2: Continuous batching and paged KV cache**
-- [x] Write our own model forward pass (embedding, RMSNorm, RoPE, attention, MLP) using HF weights
-- [x] Block allocator and block tables
-- [x] Iteration-level scheduler with chunked prefill
-- [x] Preemption: recompute, and swap to CPU (`preemption_mode="swap"`, falls back to recompute when swap space is full)
-- [x] T4 benchmark vs. batch 1 and naive Hugging Face
-- [x] Batched decode attention: one padded gather + two matmuls for every decode sequence, replacing the per-sequence loop
-- **Milestone number:** throughput at 32 users vs. Month 1 (target 5x or more): **28.7x** (1,012 vs. 35.3 tok/s)
-
-**Month 2 results (Kaggle Tesla T4, fp16, Qwen2.5-0.5B-Instruct, 64 requests x 128 output tokens, 256 MB KV cache, PyTorch ops only)**
-
-| Setup | Throughput | vs. batch 1 | vs. naive HF | Wall time | Median TTFT |
-|---|---|---|---|---|---|
-| Hugging Face `model.generate`, one request at a time | 34.9 tok/s | | 1.00x | 234.8 s | |
-| VRTX, max batch 1 | 37.2 tok/s | 1.00x | 1.07x | 220.0 s | 110 s |
-| VRTX, max batch 8 | 282.5 tok/s | 7.6x | 8.1x | 29.0 s | 12.8 s |
-| VRTX, max batch 32 | 1,012 tok/s | 27.2x | 29.0x | 8.1 s | 2.3 s |
-| VRTX, max batch 64 | **1,777 tok/s** | 47.7x | **50.9x** | 4.6 s | 0.49 s |
-
-The first T4 run of this table topped out at 130 tok/s (3.7x HF): step time grew linearly with batch size because decode attention was a Python loop, one gather and one attention call per sequence per layer. Replacing it with one batched gather + masked grouped-query matmuls, and sampling with one call per group of settings instead of one GPU sync per sequence, took batch 64 from 130 to 1,777 tok/s (13.6x) with no other change. Zero preemptions in every run. Raw JSON in `benchmarks/results/`, chart: `docs/charts/throughput_vs_users.png`.
-
-**Month 3: Kernels and quantization**
-- [x] Triton: fused add + RMSNorm, fused RoPE + KV-cache write, fused SiLU*up (`engine/kernels/`)
-- [x] Triton: paged decode attention (one program per sequence per KV head, GQA-aware, online softmax)
-- [x] Triton: flash-style paged prefill attention (causal, ragged batch, skips masked tiles)
-- [x] Int8 and int4 weight quantization with group scales; Triton matmul that dequantizes in registers
-- [x] Tests: every kernel vs. its PyTorch twin (CI runs them in Triton's CPU interpreter)
-- [x] Perplexity vs. memory chart, roofline chart (`benchmarks/plots.py`)
-- [x] T4 run
-- [x] Re-run the rewritten int8/int4 matmul on the T4: no longer collapses at large batch, still slower than fp16 at decode (see below)
-- [ ] int8 faster than fp16 at decode: needs a GEMV-style kernel for M <= 8 (no tensor cores, split-K)
-- **Milestone number:** **2.32x** end-to-end from the kernels and **2.75x** with CUDA graphs (1,714 to 4,712 tok/s at 64 users); int8 halves matmul weight memory at no perplexity cost
-
-**Month 3 results (same T4, same model)**
-
-Kernel ablation, 64 users x 128 tokens, each row adds one kernel (second T4 run):
-
-| Kernels on | Throughput | Speedup |
-|---|---|---|
-| none (PyTorch ops) | 1,714 tok/s | 1.00x |
-| + paged attention (decode + prefill) | 2,325 tok/s | 1.36x |
-| + fused RoPE + cache write | 3,097 tok/s | 1.81x |
-| + fused add + RMSNorm | 3,897 tok/s | 2.27x |
-| + fused SiLU * up | 3,970 tok/s | 2.32x |
-| + CUDA graphs | **4,712 tok/s** | **2.75x** |
-
-At batch 1 the kernels take the engine from 35.1 to 78.2 tok/s (2.2x), and CUDA graphs double that to **157.8 tok/s** (4.5x the PyTorch engine, 4.9x naive HF). Graphs help most where launches dominate: 2.0x at batch 1, 2.1x at 8 and 32, 1.6x at 64 (`docs/charts/throughput_vs_users.png`). The first run's ablation (1,783 to 4,176 tok/s, 2.34x without graphs) agrees within run-to-run noise. Per kernel vs. its PyTorch twin: RoPE + cache write 6.5x (one launch instead of ~15), add + RMSNorm 2.3-2.5x, paged decode attention 2.4-2.7x at 1-8 sequences and 1.5-1.7x at 32-64, prefill attention 1.2x, SiLU*up 1.0-2.0x (PyTorch is already one fused op for small inputs). Most small kernels sit far under the roofline (`docs/charts/roofline.png`): at T=1 a launch costs more than the work, which is what CUDA graphs fix.
-
-Quantization (WikiText-2 test, 16K tokens, 512-token windows):
-
-| Weights | Perplexity | Change | Matmul weights | Saved |
-|---|---|---|---|---|
-| fp16 | 17.41 | | 682.5 MB | |
-| int8, group 128 | **17.36** | -0.3% | **346.6 MB** | **49%** |
-| int4, group 128 | 24.52 | +40.9% | 176.0 MB | 74% |
-| int4, group 64 | 22.26 | +27.9% | 181.3 MB | 73% |
-| int4, group 32 | 20.82 | +19.6% | 192.0 MB | 72% |
-
-int8 is free in quality. int4 hurts a 0.5B model a lot; smaller groups win back half the loss for 9% more memory. Chart: `docs/charts/perplexity_vs_memory.png`.
-
-What did not work: **speed**. The first int8/int4 matmul kernel was 2-3x faster than dequantize-then-matmul in PyTorch, but still 4-7x slower than plain fp16 cuBLAS (gate_up, M=1: 571 us vs. 126 us), and 5x slower than PyTorch at M=64 (register spills from 64-row tiles with a per-element scale multiply). End to end, int8 ran at 46 tok/s at batch 1 (fp16: 81) and fell to 253 tok/s at batch 64. The rewrite in `engine/kernels/qmatmul.py`: the scale is applied once per output column per K tile instead of once per weight, weight tiles are read already transposed, tile shapes are autotuned, a Triton dequantize kernel replaces the slow PyTorch one for large M, and a router times both paths per shape once at load time and keeps the faster, so quantized can no longer be slower than dequantize + cuBLAS. Second T4 run: the router picked the dequantize path for **every** shape, M=1 included, so the fused kernel still loses to dequantize + cuBLAS even at decode. What the rewrite fixed is the collapse: int8 at 64 users went from 253 to **3,212 tok/s** (with CUDA graphs; fp16 with graphs: 4,720). What it did not fix is decode speed: int8 runs at 71 tok/s at batch 1 against fp16's 158, because dequantize-then-matmul reads the int8 weight, writes an fp16 copy and reads that copy again, 5 bytes of traffic per weight instead of 2. In isolation the quantized matmul is 2.3-2.9x (int8) and 1.7-3.7x (int4) slower than fp16 cuBLAS (gate_up, M=1: 294 us vs. 127 us). So int8 is a memory win (fit a bigger model or a bigger KV cache), not a speed win, until the decode path gets a GEMV-style kernel: at M <= 8 there is nothing for tensor cores to do, and a plain load-multiply-reduce over 1-byte weights, split along K for parallelism, is bound by 1 byte per weight and could approach 2x fp16.
-
-**Month 4: Speculative decoding and prefix caching**
-- [x] Draft/target verification with the exact rejection rule (draft shares the target's block tables)
-- [x] Adaptive gamma: per-sequence acceptance estimate + live draft/target cost ratio, backs off to plain decoding
-- [x] Prefix hashing, reference counts, LRU eviction of cached blocks, copy-on-write
-- [x] Benchmarks: prefix caching on/off, speedup vs. gamma, full serving workloads on VRTX / vLLM / HF
-- [x] T4 run and writeup vs. naive HF
-- [x] vLLM numbers on the same T4: VRTX is within 9% of vLLM 0.31 on short chat, 4% on shared prefix, and 1.45x faster on long context
-- [x] CUDA graphs for decode, draft and verify steps (`engine/cuda_graphs.py`): batches padded to fixed sizes, padding rows write into a reserved null block, shorter sequences padded at the front so causality holds; tested against the eager engine in CI
-- [x] Measure CUDA graphs on the T4: 2.0x at batch 1, 1.6x at 64 users, and speculative decoding goes from 0.94x to **1.24x**
-- **Milestone number:** **3,998 tok/s at 64 concurrent users** (short chat), **128x** naive Hugging Face and **0.91x vLLM** on the same T4
-
-**Month 4 results (same T4, same model, 64 concurrent users, prefix caching on, Triton kernels, CUDA graphs, every request forced to its full output length)**
-
-| Workload | Requests | VRTX | vLLM 0.31 | vs. vLLM | Naive HF | vs. HF | Median TTFT | TPOT | KV waste, paged vs. static 4K reserve |
-|---|---|---|---|---|---|---|---|---|---|
-| Short chat (115 in / 200 out) | 128 | **3,998 tok/s** | 4,376 tok/s | 0.91x | 31.1 tok/s | **128x** | 3.2 s | 15.6 ms | 1.7% vs. 92.3% |
-| Shared 1K system prompt (1,064 in / 128 out) | 128 | **1,994 tok/s** | 2,085 tok/s | 0.96x | 30.0 tok/s | **66x** | 4.2 s | 31.0 ms | 0.7% vs. 70.9% |
-| Long context (4,045 in / 200 out) | 32 | **197 tok/s** | 136 tok/s | **1.45x** | not run | | 12.2 s | 99.0 ms | 0.3% vs. 0% |
-
-vLLM 0.31.0 (torch 2.13, CUDA 13.0) ran with the same prompts, 64 sequences, prefix caching on, fp16, and its defaults otherwise: torch.compile, its own CUDA graphs, and the Triton attention backend (FlashAttention needs a newer GPU than the T4). It runs in its own virtual environment on the notebook, in a separate Kaggle session from the VRTX rows, on the same GPU model. On short requests vLLM's step overhead is lower: VRTX is 9% behind at 64 users, 4% behind when most of the prompt is cached. On 4K-token prompts VRTX is 1.45x faster. That is one run and the cause is not pinned down; vLLM's warning that its Triton attention kernel was still compiling during the timed run suggests part of the gap is warm-up for the long shapes, not steady state.
-
-HF ran 16 requests per workload (one at a time, so its throughput does not depend on the count). Its speed varies between Kaggle sessions (31-35 tok/s; the first run measured 34.5 and 33.5, for 110x and 60x against VRTX's 3,784 and 2,019 without graphs), so read the ratios as +-10%. Graphs barely move these rows: at 64 users each step is already big enough that launches are a small share of it. TTFT here is mostly queueing: all requests arrive at t=0. Long context is prefill-bound: 129K prompt tokens before the first output, which is where a faster prefill (bigger chunks, a better prefill kernel) would help next. Charts: `docs/charts/vs_vllm.png`, `latency_cdf.png`, `kv_waste.png`.
-
-Prefix caching on its own (1,024-token shared system prompt, 64 requests, 32 at a time): **97% hit rate, 524 to 1,597 tok/s (3.05x), median TTFT 3.47 s to 1.36 s** (`docs/charts/prefix_cache.png`).
-
-Speculative decoding (Qwen2.5-1.5B target, 0.5B draft, 8 requests x 128 tokens), with CUDA graphs: **1.24x at batch 1** (gamma 2, 61.9 to 76.6 tok/s), **1.33x at batch 4** (gamma 2), 1.27x when sampling at temperature 0.7. Adaptive gamma lands at 1.22-1.23x at batch 1 without being told the best gamma, but only 1.08x at batch 4, where it settles on less speculation than the best fixed gamma.
-
-| | draft cost / target step | gamma 1 | gamma 2 | gamma 3 | gamma 4 | gamma 6 | adaptive |
-|---|---|---|---|---|---|---|---|
-| Eager, batch 1 (first run) | 0.70 | 0.94x | 0.89x | | | 0.62x | 0.97x |
-| CUDA graphs, batch 1 | **0.33** | 1.17x | **1.24x** | 1.20x | 1.15x | 1.01x | 1.22x |
-| CUDA graphs, batch 4 | 0.33 | 0.83x | **1.33x** | 1.32x | 1.20x | 1.04x | 1.08x |
-
-Why it failed the first time: one draft step cost 0.70x a target step, where it should cost about 0.3x on bytes read. Eagerly, at batch 1, the engine is bound by kernel launches and Python, so step time follows the layer count (24 vs. 28) rather than the parameter count (0.5B vs. 1.5B). Replaying a captured graph launches each step at once, the cost ratio drops to the 0.33 the bytes predict, and the same acceptance rates (73% at gamma 1, 66% at gamma 2, 51% at gamma 4) now pay off. Past gamma 3 the falling acceptance outweighs the extra drafts. The batch 4 gamma 1 dip (0.83x) is unexplained; a third T4 run reproduced it (0.84x), so it is not noise. That third run matched every other number here within 3% (e.g. 4,758 tok/s at 64 users with graphs, 1.25x spec at gamma 2), with HF at 35 tok/s, which puts short chat at 115x. Greedy outputs matched the target alone on 5 of 8 prompts at batch 1 and 7 of 8 at batch 4. In fp32 they match exactly (tested); in fp16, scoring several tokens at once goes through the prefill attention path, which rounds differently from the one-token decode path and can flip near-ties. Chart: `docs/charts/spec_speedup_vs_gamma.png`.
-
-Known limit: prefix caching and speculative decoding can't be on at the same time yet (the draft cache would need its own prefix bookkeeping).
-
-### Phase 2: VRTX Cloud and Ops (Months 5 to 8)
-
-**Month 5: Workers and deploys**
-- [x] Worker agent (`cloud/agent/`): starts/stops replicas as Docker containers (CPU/memory limits, `--gpus all` on NVIDIA nodes) or as local processes; reports CPUs, RAM and GPU memory (nvidia-smi); health-checks every replica; heartbeats every 2 s
-- [x] Control plane API (`cloud/api/server.py`), single node: deployments, builds, nodes, routes, merged logs; a reconcile loop that places replicas, restarts crashed ones with exponential backoff (crashloop after 3), reschedules replicas of silent nodes, and does rolling updates
-- [x] State in SQLite, written only through `apply(command)` with ids and timestamps inside the command, so Month 6 can put the same commands on the Raft log (tested: replaying the commands gives the same state)
-- [x] Builder: code folder to Docker image. Uses the folder's Dockerfile, else detects FastAPI / Flask / a Python script / Node / static HTML and writes one; builds keyed by a hash of the files, so an unchanged redeploy reuses the image and rolls nothing out
-- [x] Gateway (`gateway/proxy.py`) routes `*.vrtx.local` and `*.localhost` to healthy replicas, round-robin, streaming (SSE passes through), skips dead replicas
-- [x] `vrtx up`, `vrtx deploy`, `vrtx models deploy`, `vrtx ps`, `vrtx logs [-f]`, `vrtx scale`, `vrtx rm`, `vrtx nodes`
-- [x] Tests (`tests/test_month5_cloud.py`): a full deploy -> serve -> crash -> roll out -> scale -> delete run on the process runtime, so CI needs no Docker
-- **Milestone:** deploy an app and a model with one command each: **done**. `vrtx deploy ./examples/todo-api` (build 19 s first time, 1 s cached; 2 replicas healthy 3 s later) and `vrtx models deploy ./models/qwen2.5-0.5b --name qwen-chat` (engine image 215 s the first time; weights loaded and healthy 13 s later)
-
-**Month 5 results (MacBook Air, Apple silicon, Docker Desktop, one node)**
-
-| What | Result |
-|---|---|
-| Rolling update under load (`curl` loop, 1 GET + 1 POST at a time) | **0 failed of 3,442 requests** (1,721 GET, 1,721 POST) |
-| Same, before draining | 3 failed of 1,525 (502s: old replicas were killed while the gateway still routed to them) |
-| Rollout time, 2 replicas | 4 s (15 s before agent stops went to the background) |
-| Container killed with `docker kill` | replaced automatically within seconds; exit code 137 and the last log lines kept as the deployment's last error |
-| App that exits on startup | `crashloop` after 3 tries with its real error (`DATABASE_URL is not set`), first retry at once, then 2 s, 4 s, 8 s ... up to 60 s |
-| Whole stack restarted | deployments come back at the same version once the agent re-registers (~2 s) |
-| `vrtx up` stopped (SIGTERM) | exits in ~2 s, 0 containers left behind |
-| Qwen2.5-0.5B, Docker runtime | 3.4 tok/s (Docker on macOS has no GPU: fp32 on CPU) |
-| Qwen2.5-0.5B, process runtime | 22 tok/s on the Mac's GPU (MPS), TTFT 0.08 s |
-
-What made rollouts lossless: (1) old replicas are **drained**, taken out of the routing table and stopped 3 s later, which is longer than the gateway's 1 s route refresh; (2) generated Dockerfiles `exec` the app so `docker stop`'s SIGTERM reaches it (as PID 1, `/bin/sh` ignores SIGTERM, so every stop took the full 5 s timeout); (3) the gateway retries the next replica when a connection fails, and also for idempotent requests when a replica drops mid-request.
-
-Try it (needs Docker for `--runtime docker`; `--runtime process` runs replicas as local processes):
-
-```
-pip install -e .            # gives you the `vrtx` command
-vrtx up                     # control plane :7070, agent :7071, gateway :8080
-vrtx deploy ./examples/todo-api
-curl http://todo-api.localhost:8080/todos       # *.localhost needs no DNS setup
-vrtx models deploy ./models/qwen2.5-0.5b --name qwen-chat
-curl http://qwen-chat.localhost:8080/v1/chat/completions -H 'content-type: application/json' \
-     -d '{"messages": [{"role": "user", "content": "hi"}]}'
-vrtx ps -a && vrtx logs todo-api -f
-```
-
-For `*.vrtx.local` names add them to `/etc/hosts` (`127.0.0.1 todo-api.vrtx.local`) or send a `Host:` header. Known limits: one control plane (Raft is Month 6); the process runtime only works when the builder and the worker share a machine; no WebSocket proxying yet; health checks are HTTP only.
-
-**Month 6: Raft and scheduling**
-- [ ] Raft: elections, log replication, commit, persistence
-- [ ] Move control plane state onto the Raft log
-- [ ] Bin packing: FFD, Best-Fit, scored heuristic, ILP comparison
-- **Milestone:** kill the leader mid-deploy, cluster recovers
-
-**Month 7: Autoscaling and routing**
-- [ ] Erlang C autoscaler with SLO target
-- [ ] Holt-Winters forecast, PID with hysteresis, scale to zero
-- [ ] Consistent hashing router, power-of-two-choices comparison
-- **Milestone:** p99 stays under SLO during a 10x traffic spike
-
-**Month 8: Ops and dashboard**
-- [ ] Metrics and log collector
-- [ ] Z-score anomalies, log clustering
-- [ ] AI debugger on VRTX Engine
-- [ ] Next.js dashboard (all screens in section 9)
-- [ ] Chaos tests: random node kills, network delay
-- **Milestone:** a crash gets detected and explained automatically
-
-### Phase 3: Ship it (Month 9)
-
-- [ ] Clean up code and docs
-- [ ] Technical blog post with all the charts
-- [ ] 2 to 3 minute demo video
-- [ ] Resume, LinkedIn, and portfolio updates
-
----
-
-## 13. Free compute plan
-
-| Need | Free source | Notes |
-|---|---|---|
-| Laptop work (API, scheduler logic, Raft, dashboard) | Your Mac | Use Qwen 2.5 0.5B on CPU/MPS. Slow but fine for logic |
-| Daily GPU dev | **Lightning AI** | ~80 free GPU hours/month, persistent VS Code-style workspace with SSH |
-| Daily GPU dev | **Modal** Starter plan | $30/month free credits, real datacenter GPUs, per-second billing |
-| Backup GPU | **Kaggle** notebooks | Weekly GPU quota (commonly ~30 hrs, varies). Pick the T4 |
-| Backup GPU | **Google Colab** free | Throttles at peak times |
-| Big final benchmarks | **AMD Developer Cloud** | Apply for complimentary MI300X hours (192 GB GPU). Credits expire fast, use at the end |
-| Big final benchmarks | New-account credits | Google Cloud, Azure, RunPod, Lambda trial credits |
-| Big swing | Startup credits via Bhat-Tec LLC | Modal, RunPod and others run startup credit programs |
-| Multi-machine control plane demo | **Oracle Cloud Always Free** | Free ARM VMs, no GPU needed for Raft nodes |
-| Code, CI | GitHub | Free |
-| Domain | Subdomain of therawebdesign.com | e.g. `vrtx.therawebdesign.com` |
-
-Check each provider's current terms before relying on them; free tiers change.
-
-**Rules:**
-1. Develop on the smallest model that shows the behavior.
-2. Always set auto-shutdown on GPU sessions.
-3. Save benchmark results and checkpoints to GitHub, since free sessions can get cut off.
-4. Compare systems on the same hardware. "4x faster than HF on a T4" is just as strong as on an H100.
-
----
-
-## 14. Benchmarking plan
-
-**Metrics:**
-- **TTFT** (time to first token)
-- **TPOT** (time per output token)
-- **Throughput** (output tokens/sec across all users)
-- **Latency percentiles** (p50, p95, p99)
-- **Max concurrent users** at a given p99 SLO
-- **GPU memory** used and wasted
-- **Prefix cache hit rate**
-- **Spec decoding** acceptance rate and speedup
-
-**Workloads:**
-- Short chat (100 in / 200 out)
-- Long context (4K in / 200 out)
-- Shared system prompt (tests prefix caching)
-- Bursty traffic (tests autoscaler)
-
-**Compared systems:** HF `transformers` naive generate, VRTX at each milestone, vLLM.
-
-**Charts for the writeup:** throughput vs. users, latency CDF, roofline, KV memory waste before/after paging, perplexity vs. quantization, spec decoding speedup vs. gamma, autoscaler replicas vs. traffic, Raft recovery timeline.
-
----
-
-## 15. The math cheat sheet
-
-| Concept | Formula | Where it is used |
-|---|---|---|
-| Decode ceiling | `tok/s ~= bandwidth / model bytes` | Engine design |
-| Roofline ridge | `B > peak FLOPs / bandwidth` | Batch size target |
-| KV per token | `2 x L x H_kv x d x bytes` | Memory planning |
-| Online softmax | `l_new = l e^(m - m_new) + sum e^(x - m_new)` | Flash attention kernel |
-| Quant scale | `s = max|w| / 127`, error var `s^2/12` | Int8 / int4 |
-| Spec decoding | `E = (1 - a^(g+1)) / (1 - a)` | Draft length |
-| Spec acceptance | `min(1, p/q)`, resample `norm(max(0, p - q))` | Exactness |
-| Raft majority | `floor(n/2) + 1` | Commit rule |
-| FFD bound | `<= 11/9 OPT + 6/9` | Scheduler |
-| Erlang C wait | `W_q = C(c,a) / (c mu - lambda)` | Autoscaler |
-| Wait tail | `P(W > t) = C e^(-(c mu - lambda) t)` | p99 target |
-| Little's Law | `L = lambda W` | Sanity checks |
-| Token bucket | `tokens = min(cap, tokens + r dt)` | Rate limiting |
-| Z-score | `z = (x - mean) / std` | Anomaly detection |
-| PID | `u = Kp e + Ki int(e) + Kd de/dt` | Smooth scaling |
-| Two choices | max load ~ `log log n` | Load balancing |
-
----
-
-## 16. Risks and how we handle them
-
-| Risk | Plan |
-|---|---|
-| Can't beat vLLM | We aren't trying to beat it overall. Targets: 10x+ over naive HF, within a measured % of vLLM on one workload |
-| GPU access runs out | Stack several free tiers; most of Phase 2 needs no GPU at all |
-| Triton kernels are hard to debug | Always test against a PyTorch reference; start with the simplest kernel (RMSNorm) |
-| Raft has subtle bugs | Write tests that randomly drop/delay messages and kill nodes |
-| Scope creep | Each month has one milestone number. Stretch goals stay stretch |
-| Mac has no CUDA | Logic on the Mac, GPU code on Lightning AI / Modal / Kaggle |
-
----
-
-## 17. What "done" looks like
-
-- Public GitHub repo with clean code, tests, and this README
-- Benchmark charts with real numbers
-- A demo video showing:
-  1. Live token streaming in the playground
-  2. Traffic spike and the autoscaler adding replicas
-  3. Killing the Raft leader and the cluster recovering
-  4. An app crashing and VRTX Ops explaining why
-- A technical blog post
-- The resume line from section 1 with real values for X and Y
-
----
-
-## 18. Getting started today
-
-On your Mac, from this folder:
+You need Python 3.11+. Nothing else.
 
 ```bash
-# 1. Create a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Start the server (downloads Qwen 2.5 0.5B the first time, ~1 GB)
-uvicorn gateway.server:app --port 8000
-
-# 4. In another terminal, chat with it (streaming)
-curl -N http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Explain GPUs in one sentence"}],"stream":true}'
-
-# 5. Get your first baseline number
-python -m benchmarks.bench_naive
-
-# 6. Months 2-4 (all work on a Mac; the Triton kernels switch on automatically on CUDA)
-python -m pytest tests/ -q
-python -m benchmarks.bench_batching                  # continuous batching
-python -m benchmarks.bench_quant                     # int8 / int4 perplexity vs memory
-python -m benchmarks.bench_prefix                    # prefix caching on/off
-VRTX_QUANT=8 uvicorn gateway.server:app --port 8000  # serve int8 weights
+pip install "git+https://github.com/JacobBhatt12/atr"
 ```
 
-GPU numbers: open `scripts/kaggle_benchmark.ipynb` on Kaggle (GPU T4, internet on), Run All, then `python -m benchmarks.plots` on the downloaded results.
-
-Then:
+Then add ATR to your AI app. `--demo` connects a built-in fake server with 50 tools (GitHub, Slack, logs, a database, a calendar), so you can watch the savings right away:
 
 ```bash
-git init
-git add .
-git commit -m "VRTX: Month 1 starter"
-# create a repo on GitHub named vrtx and push
+claude mcp add atr -- atr serve --demo        # Claude Code
+codex mcp add atr -- atr serve --demo         # Codex CLI
+```
+
+For Claude Desktop, Cursor and others, add this to the app's MCP config:
+
+```json
+{ "mcpServers": { "atr": { "command": "atr", "args": ["serve", "--demo"] } } }
+```
+
+Now ask the AI something like *"find the failing errors in the service logs"* or *"list the open GitHub issues"*, then *"show ATR stats"*. It finds the tool it needs instead of loading all 50, and the stats show tokens before and after. The demo data is fake and nothing leaves your machine.
+
+ATR's coding tools (`atr_repo_map`, `atr_search_code`, `atr_read_file`) work on your real files with no setup. They never open secrets such as `.env` files and keys. To put your own MCP servers behind ATR, drop `--demo` and run `atr init` (below).
+
+## Install and connect
+
+```bash
+git clone https://github.com/JacobBhatt12/atr && cd atr
+pip install -e .                       # no dependencies; add .[exact,docs] for tiktoken + PDF/Word support
+atr init --from ~/Library/Application\ Support/Claude/claude_desktop_config.json
+```
+
+`atr init` copies your existing servers into `~/.atr/config.json` and prints the one entry your client needs:
+
+```json
+{ "mcpServers": { "atr": { "command": "/path/to/python", "args": ["-m", "atr", "serve"] } } }
+```
+
+Then **replace** your client's other `mcpServers` with that entry. If you keep both, the old servers still send their full schemas and you save nothing.
+
+| Client | Where the config goes |
+|---|---|
+| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Claude Code | `claude mcp add atr -- python -m atr serve` (and remove the servers ATR now runs) |
+| Cursor | `~/.cursor/mcp.json` |
+| Zed / VS Code / Windsurf | their MCP settings, same command and args |
+
+If ATR says `No module named 'atr'` on macOS, the install's `.pth` files were flagged hidden, and recent Python versions skip hidden `.pth` files. Run `chflags nohidden .venv*/lib/python*/site-packages/*.pth`. The config entry from `atr snippet` sets `PYTHONPATH` so it isn't affected.
+
+### Coding tools
+
+For coding, ATR adds four tools that cut the usual token sinks: opening whole files, wide searches, and long test or build output.
+
+| Tool | Instead of | Example on this repo |
+|---|---|---|
+| `atr_repo_map` | opening files one by one to learn the layout | whole project, with each file's functions and classes: **~3,000 tokens** (reading every `.py` file: ~159,000) |
+| `atr_search_code` | grep output that runs for pages | results grouped by file, capped per file, `glob=` to narrow it down |
+| `atr_read_file` | reading a 500-line file to see one function | an outline first, then `lines="120-180"`, or `search=` with `context=` |
+| `atr_run` | 3,000 lines of test output | exit code + the failures; repeated lines collapsed; full output kept for `atr_query` |
+
+- **Read-only tools:** `atr_repo_map`, `atr_search_code` and `atr_read_file`. Code output is only ever trimmed by length, so indentation is never touched.
+- **`atr_run`** is marked as changing things, so clients ask before running it.
+- **Where they work:** all four stay inside `read_roots` and start in `project` (default: the folder ATR was started from).
+- **Local apps:** in Claude Code, Cursor and similar apps, they're on by default.
+- **Over `--http`:** they're off unless you start with `--read-files`, plus `--allow-run` for commands. Add `--project <folder>` to limit them to one folder: anyone with the link gets what those flags allow.
+- **Secrets are never read, listed or searched, in any mode:** `.env` files, SSH and other private keys, cloud credentials, ATR's own token, and data files whose names say they hold keys, passwords or tokens (for example `Access-Keys.ini`). Template files like `.env.example` are fine.
+
+### Read vs. write: approve only what changes things
+
+ATR runs downstream tools through two tools, so your client can treat them differently:
+
+- **`atr_read`** runs tools that only read. A tool counts as read-only when its server marks it that way (`readOnlyHint: true`, not destructive) or your config lists it under `read_only`. ATR marks `atr_read` read-only too, so you can set it to **Always allow**.
+- **`atr_call`** runs everything else. ATR marks it as changing things, so you keep it on **Needs approval**.
+- **Unmarked tools count as changing things.** A tool sent to `atr_read` that isn't read-only is refused, and the model is told to use `atr_call`.
+- **You can see it before anything runs:** `atr_find_tools` tags every result `[r]` or `[w]`.
+- **Overrides:** many servers don't mark their tools yet. Use `read_only` in the config to allow them (globs work: `github__list_*`), or `write` to force approval. `write` wins over everything.
+
+In claude.ai, set `atr_find_tools`, `atr_read`, `atr_query` and `atr_stats` to Always allow and `atr_call` to Needs approval. Reads then run on their own, and changes ask first.
+
+### Config (`~/.atr/config.json`)
+
+```jsonc
+{
+  "servers": { "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "…"} } },
+  "expose": "search",                 // "search": only ATR's tools; "all": every tool, slimmed, results compressed
+  "pin": ["github__create_issue"],    // tools you use constantly, always shown directly
+  "budget": 1500,                     // max tokens for any single tool result
+  "level": 2,                         // 1 = nearly lossless, 2 = default, 3 = aggressive
+  "read_roots": ["~"]                 // folders atr_read_file is allowed to read
+}
+```
+
+### For claude.ai and ChatGPT: `atr serve --http`
+
+claude.ai and ChatGPT connect to *remote* MCP servers. That means a public https URL, because their servers have to reach yours.
+
+```bash
+pip install -e '.[http]'
+atr serve --http                                   # prints http://127.0.0.1:8789/mcp/<secret>
+cloudflared tunnel --url http://127.0.0.1:8789     # free; prints https://<random>.trycloudflare.com
+```
+
+Then add `https://<random>.trycloudflare.com/mcp/<secret>` as a connector:
+
+- **claude.ai:** Settings → Connectors → Add custom connector
+- **ChatGPT:** Settings → Apps & Connectors → developer mode → create a connector, with no authentication. The secret in the URL is the auth.
+
+These menus move around, and which plans allow custom connectors changes often, so check each app's help page.
+
+**Security.** Anyone with that URL can run your downstream tools with your credentials.
+
+- The secret is created once and saved in `~/.atr/http_token`. Delete that file to rotate it.
+- `atr_read_file` is off over HTTP unless you pass `--read-files`.
+- Browser requests from origins other than localhost, claude.ai and chatgpt.com are refused.
+- Stop the tunnel when you're not using it.
+
+For a link that never changes, use Tailscale Funnel instead of a quick tunnel: `tailscale funnel --bg 8789` gives `https://<machine>.<tailnet>.ts.net/mcp/<secret>`.
+
+ATR can also sit in front of **remote** MCP servers. Give a server a `url` (and optional `headers`, for example an `Authorization` bearer token) instead of a `command`. OAuth sign-in for remote servers isn't supported yet.
+
+### Without MCP: `atr compress`
+
+```bash
+atr compress dump.json --budget 800 --copy     # compress, copy to clipboard, paste into any chat
+pbpaste | atr compress --copy                  # shrink whatever is on the clipboard
 ```
 
 ---
 
-## 19. Reading list
+## What works where
 
-Read these in roughly this order as you reach each month:
+| App / plan | MCP server (schemas + results) | `atr compress` |
+|---|---|---|
+| Claude Desktop (Free, Pro, Max) | ✅ local MCP servers | ✅ |
+| Claude Code, Codex CLI | ✅ | ✅ |
+| Cursor, Zed, VS Code, Windsurf | ✅ | ✅ |
+| claude.ai web (plans with custom connectors) | ✅ `atr serve --http` + a tunnel | ✅ |
+| ChatGPT paid (developer mode) | ✅ `atr serve --http` + a tunnel | ✅ |
+| ChatGPT Free, Gemini app | ❌ no custom MCP | ✅ |
+| Your own app / agent | ✅ (if it uses MCP) | ✅ |
 
-1. *Attention Is All You Need* (Vaswani et al., 2017): the transformer
-2. Andrej Karpathy, *nanoGPT* and *Let's build GPT* video: write a model from scratch
-3. *FlashAttention* (Dao et al., 2022): tiling and online softmax
-4. *Efficient Memory Management for LLM Serving with PagedAttention* (Kwon et al., 2023): vLLM's paper
-5. *Orca: A Distributed Serving System for Transformer-Based Generative Models* (2022): continuous batching
-6. *Fast Inference from Transformers via Speculative Decoding* (Leviathan et al., 2023)
-7. Triton tutorials (official docs): vector add, softmax, matmul, fused attention
-8. *In Search of an Understandable Consensus Algorithm* (Ongaro and Ousterhout, 2014): Raft
-9. The Raft visualization at raft.github.io
-10. Mor Harchol-Balter, *Performance Modeling and Design of Computer Systems*: queueing theory
-11. *Large-scale cluster management at Google with Borg* (2015): scheduling at scale
-12. Martin Kleppmann, *Designing Data-Intensive Applications*
+Plan features change often. Check your app's current MCP support.
+
+### Limits
+
+- **A free plan won't become a Pro plan.** Usage limits are set by the provider, and paid plans also include better models and features. ATR makes each message cost less, so the same limit covers a lot more work, especially in tool-heavy chats. Measuring this on real usage is part of month 3.
+- **The MCP server can't see or edit your chat history.** MCP servers only see the tool calls sent to them, never the conversation. Some guides say an MCP server can summarize your chat automatically; it can't. For long chats, use the client's own `/compact`, or start a new chat with a short summary.
+- **Searching for tools adds one step.** Finding a tool is an extra call (about 130 tokens). Pin the tools you use constantly to skip it.
+
+---
+
+## Repo layout
+
+```
+atr/                ATR (stdlib only; HTTP mode needs .[http])
+  server.py         the MCP server your client connects to (stdio)
+  remote.py         the same server over Streamable HTTP (atr serve --http)
+  downstream.py     MCP client for the servers ATR runs behind it (stdio and HTTP)
+  code.py           repo map, code search, command runner (coding tools)
+  compress.py       the compression pipeline
+  stash.py          full results kept by ref + atr_query
+  router.py         BM25 tool search, schema slimming, one-line signatures
+  config.py · cli.py · tokens.py
+  tests/            34 tests and a fake 50-tool server (python -m pytest atr/tests -c /dev/null)
+benchmarks/bench_atr.py       the savings table above
+gen-context.config.json       settings for SigMap, which runs behind ATR (only the tools ATR doesn't have)
+```
+
+---
+
+## Build plan
+
+| Month | Goal | Done when |
+|---|---|---|
+| **1** ✅ | Stdio MCP proxy, compression, stash + query, BM25 tool search, CLI | 15 tests pass; 95% schema and 99%+ big-result savings measured |
+| **2** ✅ v1 | **Streamable HTTP**, both directions: `atr serve --http` (token-protected) and remote downstream servers by `url`. **Still to do:** OAuth (sign-in) for remote servers, and a real test from claude.ai and ChatGPT through a tunnel | v1: transport tests + an end-to-end ATR → remote ATR → tools chain. Done when: both apps call ATR tools |
+| **3** | **Session memory for tool calls**: return a short "same as r2" instead of repeating a result, send only what changed when the same tool is called again, and let the model pin which fields it cares about | Repeated calls cost less than 10% of the first |
+| **4** | **Local summarizer**: a small local model summarizes long text results when cutting them would lose meaning | Summaries beat head/tail on a QA benchmark |
+| **5** | Embedding search for tools (optional), per-tool compression profiles, a dashboard of tokens saved per day | Published package + write-up with before/after numbers |
+

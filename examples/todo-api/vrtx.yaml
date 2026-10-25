@@ -1,3 +1,0 @@
-name: todo-api
-replicas: 2
-health: /health

@@ -1,0 +1,40 @@
+{
+  "tokenizer": "tiktoken",
+  "rows": [
+    {
+      "scenario": "50 tool schemas, sent every turn",
+      "before": 11256,
+      "after": 541,
+      "saved_pct": 95.2,
+      "note": "+134 tokens per atr_find_tools call"
+    },
+    {
+      "scenario": "1,000 GitHub issues (JSON), 1,500 budget",
+      "before": 429203,
+      "after": 879,
+      "saved_pct": 99.8,
+      "note": "271 ms, rest stashed for atr_query"
+    },
+    {
+      "scenario": "30 GitHub issues, no budget (lossless)",
+      "before": 12878,
+      "after": 3448,
+      "saved_pct": 73.2,
+      "note": "9 ms"
+    },
+    {
+      "scenario": "2,000-line service log, 600 budget",
+      "before": 61072,
+      "after": 206,
+      "saved_pct": 99.7,
+      "note": "37 ms"
+    },
+    {
+      "scenario": "Fetched web page (HTML)",
+      "before": 930,
+      "after": 350,
+      "saved_pct": 62.4,
+      "note": "1 ms"
+    }
+  ]
+}

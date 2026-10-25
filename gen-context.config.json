@@ -1,0 +1,30 @@
+{
+  "_comment": "SigMap settings for use behind ATR: index the ATR code, keep SigMap output inside .context/ (git-ignored), and offer only the tools ATR doesn't already have",
+  "srcDirs": [
+    "atr",
+    "benchmarks"
+  ],
+  "output": ".context/sigmap-context.md",
+  "adapters": [
+    "copilot"
+  ],
+  "mcp": {
+    "tools": [
+      "query_context",
+      "get_callee_signatures",
+      "get_impact",
+      "get_method_impact",
+      "verify_suggestion",
+      "get_diff_context",
+      "get_architecture_overview",
+      "explain_file",
+      "query_knowledge_map",
+      "get_routing",
+      "read_memory",
+      "create_checkpoint",
+      "sigmap_notify_file_created",
+      "sigmap_notify_symbol_added",
+      "sigmap_notify_file_deleted"
+    ]
+  }
+}
