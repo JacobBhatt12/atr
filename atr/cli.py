@@ -8,6 +8,8 @@
     atr init [--from CLIENT_CONFIG]     write ~/.atr/config.json (moving servers over from e.g.
                                         claude_desktop_config.json) and print what to put in the client
     atr snippet                         print the client config entry for ATR
+    atr setup [--yes] [--undo]          add ATR to Claude Code / Codex / Claude Desktop / Cursor / Windsurf,
+                                        moving their MCP servers behind it
 """
 from __future__ import annotations
 
@@ -102,6 +104,13 @@ def cmd_init(a: argparse.Namespace) -> None:
     print(json.dumps({"mcpServers": snippet()}, indent=2))
 
 
+def cmd_setup(a: argparse.Namespace) -> None:
+    from atr import setup
+
+    only = [x.strip() for x in a.only.split(",")] if a.only else None
+    sys.exit(setup.undo(only) if a.undo else setup.run(a.yes, only, a.dry_run))
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="atr", description="ATR: Automation for Token Reduction")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -127,6 +136,12 @@ def main(argv: list[str] | None = None) -> None:
     i.add_argument("--from", dest="source", help="client config to take servers from")
     i.add_argument("--force", action="store_true")
     i.set_defaults(fn=cmd_init)
+    su = sub.add_parser("setup", help="add ATR to your AI apps, with their MCP servers moved behind it")
+    su.add_argument("--yes", action="store_true", help="don't ask first")
+    su.add_argument("--undo", action="store_true", help="put every app back the way it was")
+    su.add_argument("--dry-run", action="store_true", help="only show the plan")
+    su.add_argument("--only", help="comma-separated: claude-code,codex,claude-desktop,cursor,windsurf")
+    su.set_defaults(fn=cmd_setup)
     sn = sub.add_parser("snippet", help="print the client config entry for ATR")
     sn.set_defaults(fn=lambda a: print(json.dumps({"mcpServers": snippet()}, indent=2)))
     a = p.parse_args(argv)

@@ -78,24 +78,26 @@ You need Python 3.11+. Nothing else.
 
 ```bash
 pip install "git+https://github.com/JacobBhatt12/atr"
+atr setup
 ```
 
-Then add ATR to your AI app. `--demo` connects a built-in fake server with 50 tools (GitHub, Slack, logs, a database, a calendar), so you can watch the savings right away:
+`atr setup` finds Claude Code, Codex, Claude Desktop, Cursor and Windsurf on your machine, shows you the plan, and asks before it changes anything. Then for each app it:
+
+1. moves the app's MCP servers behind ATR (only the ones that run on your machine; remote servers that need a sign-in stay where they are), and
+2. adds ATR to the app.
+
+Restart the app and it works: tool lists and tool results go through ATR and get smaller. `atr setup --undo` puts every app back exactly as it was, and each changed file also gets an `.atr-backup` copy. `atr setup --dry-run` only shows the plan.
+
+**No MCP servers yet?** Use the demo instead. It's a built-in fake server with 50 tools (GitHub, Slack, logs, a database, a calendar), so you can watch the savings right away:
 
 ```bash
 claude mcp add atr -- atr serve --demo        # Claude Code
 codex mcp add atr -- atr serve --demo         # Codex CLI
 ```
 
-For Claude Desktop, Cursor and others, add this to the app's MCP config:
+Ask something like *"list the open GitHub issues"*, then *"show ATR stats"*. The demo data is fake and nothing leaves your machine.
 
-```json
-{ "mcpServers": { "atr": { "command": "atr", "args": ["serve", "--demo"] } } }
-```
-
-Now ask the AI something like *"find the failing errors in the service logs"* or *"list the open GitHub issues"*, then *"show ATR stats"*. It finds the tool it needs instead of loading all 50, and the stats show tokens before and after. The demo data is fake and nothing leaves your machine.
-
-ATR's coding tools (`atr_repo_map`, `atr_search_code`, `atr_read_file`) work on your real files with no setup. They never open secrets such as `.env` files and keys. To put your own MCP servers behind ATR, drop `--demo` and run `atr init` (below).
+**What to expect.** ATR saves the most when you have several MCP servers or tools that return big results (issue lists, logs, database rows, web pages). Claude Code already loads MCP tool descriptions only when it needs them, so there most of the savings come from smaller results. Without any MCP servers, ATR adds its coding tools (`atr_repo_map`, `atr_search_code`, `atr_read_file`). They work on your real files with no setup and never open secrets such as `.env` files and keys, but on code alone the savings are small.
 
 ## Install and connect
 
