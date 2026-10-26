@@ -1,6 +1,6 @@
-"""A stand-in MCP server with 50 tools and bloated results, for tests and the benchmark.
+"""A stand-in MCP server with 50 tools and bloated results, for `atr serve --demo`, tests and the benchmark.
 
-Run directly: python -m atr.tests.fake_server   (stdio, newline-delimited JSON-RPC)
+Run directly: python -m atr.demo_server   (stdio, newline-delimited JSON-RPC)
 """
 from __future__ import annotations
 

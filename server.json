@@ -7,12 +7,12 @@
     "url": "https://github.com/JacobBhatt12/atr",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "1.0.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "atr-mcp",
-      "version": "0.3.0",
+      "version": "1.0.0",
       "transport": {
         "type": "stdio"
       }

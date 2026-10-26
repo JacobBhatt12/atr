@@ -13,3 +13,7 @@ build/
 # private launch notes
 LAUNCH-CHECKLIST.md
 *.docx
+
+# local tool output and dev config
+.playwright-mcp/
+gen-context.config.json

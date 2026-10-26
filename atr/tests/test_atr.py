@@ -17,9 +17,9 @@ from atr.config import Config
 from atr.router import ToolIndex, signature, slim_schema
 from atr.server import ATRServer
 from atr.stash import query
-from atr.tests import fake_server
+from atr import demo_server
 
-FAKE = {"fake": {"command": sys.executable, "args": ["-m", "atr.tests.fake_server"]}}
+FAKE = {"fake": {"command": sys.executable, "args": ["-m", "atr.demo_server"]}}
 
 
 # ------------------------------------------------------------------ compression
@@ -42,7 +42,7 @@ def test_list_of_objects_becomes_table_with_constant_columns_lifted():
 
 
 def test_big_payload_meets_budget_and_marks_loss():
-    data = fake_server.issues(1000)
+    data = demo_server.issues(1000)
     raw = json.dumps(data, indent=2)
     r = compress(raw, budget=1500)
     assert r.before > 100_000
@@ -57,7 +57,7 @@ def test_never_makes_small_input_bigger():
 
 
 def test_logs_collapse_repeats_and_keep_the_error():
-    r = compress(fake_server.logs(2000), budget=400)
+    r = compress(demo_server.logs(2000), budget=400)
     assert "similar lines" in r.text
     assert "ConnectionResetError" in r.text
     assert '\n  File "app/handler.py"' in r.text  # indentation survives
@@ -65,7 +65,7 @@ def test_logs_collapse_repeats_and_keep_the_error():
 
 
 def test_html_becomes_text():
-    html = fake_server.call("web_fetch_url", {})["content"][0]["text"]
+    html = demo_server.call("web_fetch_url", {})["content"][0]["text"]
     r = compress(html)
     assert "<div" not in r.text and "var x" not in r.text and "color:red" not in r.text
     assert "Paragraph 0 of the article." in r.text
@@ -79,7 +79,7 @@ def test_json_lines_are_parsed():
 # ------------------------------------------------------------------ stash queries
 
 def test_query_filters_fields_and_groups():
-    raw = json.dumps({"items": fake_server.issues(200)})
+    raw = json.dumps({"items": demo_server.issues(200)})
     res = query(raw, path="items", where=["state=open", "comments>8"], fields=["number", "user.login"], limit=5)
     assert res["returned"] <= 5 and res["total"] > 0
     assert set(res["rows"][0]) == {"number", "user.login"}
@@ -88,14 +88,14 @@ def test_query_filters_fields_and_groups():
 
 
 def test_query_text_search():
-    res = query(fake_server.logs(500), search="error|traceback")
+    res = query(demo_server.logs(500), search="error|traceback")
     assert res["matches"] == 3 and "ERROR" in res["lines"][0]
 
 
 # ------------------------------------------------------------------ tool routing
 
 def test_router_finds_the_right_tools():
-    idx = ToolIndex({t["name"]: t for t in fake_server.tools()})
+    idx = ToolIndex({t["name"]: t for t in demo_server.tools()})
     assert idx.search("open a new github issue", 3)[0][0] == "github_create_issue"
     assert idx.search("post a message in slack", 3)[0][0] == "slack_send_message"
     assert "logs_rollback_deploy" in [n for n, _ in idx.search("roll back the last deploy", 3)]
@@ -103,7 +103,7 @@ def test_router_finds_the_right_tools():
 
 
 def test_slim_schema_and_signature():
-    t = fake_server.tools()[0]
+    t = demo_server.tools()[0]
     slim = slim_schema(t["inputSchema"])
     assert "$schema" not in slim and "title" not in slim["properties"]["owner"]
     assert slim["required"] == ["owner", "repo"]

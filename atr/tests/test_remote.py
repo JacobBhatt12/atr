@@ -21,7 +21,7 @@ from atr.config import Config  # noqa: E402
 from atr.remote import create_remote  # noqa: E402
 from atr.server import ATRServer  # noqa: E402
 
-FAKE = {"fake": {"command": sys.executable, "args": ["-m", "atr.tests.fake_server"]}}
+FAKE = {"fake": {"command": sys.executable, "args": ["-m", "atr.demo_server"]}}
 
 
 def rpc(mid, method, params=None):

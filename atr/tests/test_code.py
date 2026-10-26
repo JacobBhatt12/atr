@@ -175,7 +175,7 @@ def test_downstream_call_refuses_secret_paths():
     from atr.config import Config
     from atr.server import ATRServer
     async def go():
-        srv = ATRServer(Config(servers={"fake": {"command": sys.executable, "args": ["-m", "atr.tests.fake_server"]}}))
+        srv = ATRServer(Config(servers={"fake": {"command": sys.executable, "args": ["-m", "atr.demo_server"]}}))
         await srv.start()
         try:
             bad = await srv.call("atr_call", {"tool": "fake__github_list_issues", "arguments": {"path": "../.env"}})
@@ -319,7 +319,7 @@ def test_browser_snapshot_keeps_text_and_refs_drops_layout():
 
 
 def test_atr_call_accepts_arguments_as_a_json_string():
-    srv = ATRServer(Config(servers={"fake": {"command": sys.executable, "args": ["-m", "atr.tests.fake_server"]}}))
+    srv = ATRServer(Config(servers={"fake": {"command": sys.executable, "args": ["-m", "atr.demo_server"]}}))
 
     async def go():
         await srv.start()

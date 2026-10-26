@@ -2,7 +2,7 @@
 
     python -m benchmarks.bench_atr            (no GPU, no network, ~1 second)
 
-MCP scenarios come from atr/tests/fake_server.py, a 50-tool server whose definitions and
+MCP scenarios come from atr/demo_server.py, a 50-tool server whose definitions and
 results are shaped like real ones (GitHub REST payloads, service logs, a fetched web page).
 Coding scenarios run in a throwaway project: a real `pytest -v` run (if pytest is installed), a real
 git repo with a lockfile change, a re-read after an edit, and install/jest logs shaped like real ones.
@@ -24,11 +24,11 @@ from atr.compress import compress, compress_output
 from atr.config import Config
 from atr.server import ATRServer
 from atr import code
-from atr.tests import fake_server as fake
+from atr import demo_server as fake
 
 
 async def schemas() -> tuple[int, int, int]:
-    srv = ATRServer(Config(servers={"fake": {"command": sys.executable, "args": ["-m", "atr.tests.fake_server"]}}))
+    srv = ATRServer(Config(servers={"fake": {"command": sys.executable, "args": ["-m", "atr.demo_server"]}}))
     await srv.start()
     try:
         found = await srv.call("atr_find_tools", {"query": "list github issues"})

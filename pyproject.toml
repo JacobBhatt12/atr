@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atr-mcp"
-version = "0.3.0"
+version = "1.0.0"
 description = "ATR: Automation for Token Reduction. An MCP proxy that hides tool lists and shrinks tool results so your AI uses fewer tokens."
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Jacob Bhatt" }]
 keywords = ["mcp", "model-context-protocol", "llm", "tokens", "claude", "codex", "ai-agents", "proxy"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
@@ -43,3 +43,4 @@ atr-mcp = "atr.cli:serve_main"   # `uvx atr-mcp` starts the MCP server (what MCP
 
 [tool.setuptools.packages.find]
 include = ["atr*"]
+exclude = ["atr.tests*"]

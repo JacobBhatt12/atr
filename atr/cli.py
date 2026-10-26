@@ -47,7 +47,7 @@ def saved_token() -> str:
     return tok
 
 
-DEMO = {"command": sys.executable, "args": ["-m", "atr.tests.fake_server"]}
+DEMO = {"command": sys.executable, "args": ["-m", "atr.demo_server"]}
 
 
 def load_config(a: argparse.Namespace) -> Config:
