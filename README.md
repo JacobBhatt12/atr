@@ -40,7 +40,7 @@ ATR sits between your AI app and your tools:
 You need Python 3.11 or newer.
 
 ```bash
-pip install "git+https://github.com/JacobBhatt12/atr"
+pip install atr-mcp
 atr setup
 ```
 
@@ -55,7 +55,7 @@ Restart your apps and you're done.
 |---|---|
 | `atr setup --dry-run` | Shows the plan without changing anything |
 | `atr setup --undo` | Puts every app back exactly how it was |
-| `pip install --upgrade "git+https://github.com/JacobBhatt12/atr"` | Updates ATR |
+| `pip install --upgrade atr-mcp` | Updates ATR |
 
 Every file `atr setup` changes also gets a backup copy (`.atr-backup`).
 
@@ -148,7 +148,7 @@ The AI uses these. You don't need to call them yourself.
 These apps can only reach servers on the internet, so ATR needs a public link.
 
 ```bash
-pip install "atr[http] @ git+https://github.com/JacobBhatt12/atr"
+pip install "atr-mcp[http]"
 atr serve --http                               # prints a link with a secret in it
 tailscale funnel --bg 8789                     # a permanent public https link (or: cloudflared tunnel --url http://127.0.0.1:8789)
 ```
