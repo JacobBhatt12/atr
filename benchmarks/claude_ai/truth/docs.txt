@@ -1,0 +1,4 @@
+README: Python 3.11+.
+README: uv add "mcp[cli]"      # or: pip install "mcp[cli]"
+pyproject: ['requires-python = ">=3.11"']
+pypi: >=3.10

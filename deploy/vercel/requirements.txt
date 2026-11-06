@@ -1,0 +1,8 @@
+fastapi>=0.110
+httpx>=0.27
+cryptography>=42
+trafilatura>=2.0
+pypdfium2>=4.30
+mammoth>=1.6
+python-pptx>=1.0
+openpyxl>=3.1

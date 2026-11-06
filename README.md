@@ -4,9 +4,9 @@
 
 **ATR makes your AI use fewer tokens when it works with tools.** Fewer tokens means lower bills and fewer "usage limit reached" messages.
 
-It works with Claude Code, Codex, Claude Desktop, Cursor, Windsurf, claude.ai and ChatGPT. It's free and runs on your own computer.
+It works with Claude Code, Codex, Claude Desktop, Cursor, Windsurf, claude.ai and ChatGPT. It's free. Run it on your own computer, or add the hosted connector to a chatbot in a minute, with no install: **https://atr-mcp.vercel.app** (connector link: `https://atr-mcp.vercel.app/mcp`).
 
-![ATR demo: 1,000 GitHub issues go from 329,732 tokens to 1,442, and the tool list from 12,376 to 1,438](https://raw.githubusercontent.com/JacobBhatt12/atr/main/assets/demo.gif)
+![ATR in a chatbot: GitHub issues, web search, PDFs, places and weather, with 30 issues cut from 53,724 tokens to 419 and a PDF from 9,962 to 263](https://raw.githubusercontent.com/JacobBhatt12/atr/main/assets/demo.gif)
 
 ## The problem
 
@@ -24,13 +24,9 @@ ATR sits between your AI app and your tools:
 - **Nothing is lost.** When ATR cuts something, it keeps the full result, and the AI can ask for any part of it.
 
 ```
-  Your AI app (Claude Code, Codex, Claude Desktop, …)
-          │  sees a few small ATR tools instead of every tool
-          ▼
-        ATR  ← finds the right tool, runs it, shrinks the result
-          │
-          ▼
-  Your MCP servers (GitHub, Playwright, Postgres, Slack, …)
+ 
+ 
+ 
 ```
 
 ---
@@ -113,6 +109,18 @@ In each case, the parts that matter are kept: errors, failing tests, changed cod
 
 The AI uses these. You don't need to call them yourself.
 
+**In the free hosted connector**
+
+| Tool | What it does |
+|---|---|
+| `atr_fetch` | Reads live web pages, PDFs, Office documents and JSON as compact text |
+| `atr_search` | Searches the web with DuckDuckGo, Bing and Brave at once and returns one short merged list (about 60 tokens a result); no API key needed |
+| `atr_places` | Finds local businesses and places with free OpenStreetMap data; no API key needed |
+| `atr_site` | Inspects a website or searches its public sitemap and navigation |
+| `atr_weather` | Gets current weather and up to seven forecast days; no API key needed |
+| `atr_query` | Retrieves more from a large result ATR kept |
+| `atr_stats` | Shows how many tokens ATR has saved |
+
 **For your MCP servers**
 
 | Tool | What it does |
@@ -144,6 +152,16 @@ The AI uses these. You don't need to call them yourself.
 ---
 
 ## Using ATR in claude.ai or ChatGPT
+
+**No install:** add the hosted connector `https://atr-mcp.vercel.app/mcp` the same way (Settings → Connectors → Add custom connector, no sign-in). Then do the one-time step below.
+
+**Tell your chatbot to use it.** Chatbots pick their own built-in web tools first, and in tests Claude never chose ATR by itself. Add this once under Settings → Profile → personal preferences (or in a Project's instructions):
+
+> When I ask you to search the web or read a link, use atr_search and atr_fetch instead of the built-in web tools.
+
+Or skip the setup and ask your question and add "use atr", like "What is the latest on the MCP spec? Use atr." (or "use atr_search", "use atr_fetch"). This is only needed for the web tools. Tools you put behind ATR (GitHub, for example) are found by name.
+
+For your own tools behind ATR, you need a link of your own:
 
 These apps can only reach servers on the internet, so ATR needs a public link.
 

@@ -1,0 +1,6 @@
+1. Blender's UI and Runtime: Much Faster Than GPUI — 45
+2. Claude Code sends your email address to websites — 1050
+3. sshole — 2653
+4. MS Paint Remote Code Execution Vulnerability — 516
+5. Britain to make salary disclosure in job ads mandatory — 85
+6. Pwn.college — 134
