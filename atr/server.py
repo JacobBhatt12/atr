@@ -564,7 +564,7 @@ class ATRServer:
 
     def _count(self, before: int, after: int) -> None:
         self.stats["results_before"] += before
-        self.stats["results_after"] += after
+        self.stats["results_after"] += min(after, before)   # a result ATR made longer counts as no change, not a loss
         self.stats["calls"] += 1
 
     def query_ref(self, a: dict) -> dict:

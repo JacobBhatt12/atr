@@ -78,6 +78,8 @@ PROXY_INSTRUCTIONS = (
     "Add question= (what you need from the result) to get only the parts or list items that answer it. "
     "Large results come back summarized with a ref; use atr_query on the ref instead of calling the tool again.")
 
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+RECEIPT_MIN = 200             # tokens a result must save before it gets an "atr saved" note
 QUESTION_BUDGET = 250         # tokens atr_fetch returns for question= by default
 SEARCH_BUDGET = 600           # tokens search= returns by default
 WH = re.compile(r"\b(who|what|when|where|which|why|how)\b", re.I)
@@ -433,10 +435,21 @@ class HostedServer(ATRServer):
             if end < len(lines):
                 text += (f"\n\n[atr: {len(lines) - end} more lines. Read on: atr_fetch(url=\"{page.url}\", offset={end}); "
                          f"or find one thing: atr_fetch(url=\"{page.url}\", search=\"…\")]")
-        self._count(before, tokens.count(text))
+        after = tokens.count(text)
+        if before - after >= RECEIPT_MIN:   # this server can't keep a running total (see stats_text), so say it here
+            text += f"\n[atr saved {before - after:,} tokens ({before:,}→{after:,})]"
+        self._count(before, after)
         return text_result(text)
 
     def stats_text(self) -> str:
+        if ON_VERCEL:
+            # Vercel runs each request on whichever machine is free, and every machine counts only its own
+            # requests, so a total here would be wrong (it showed "1 call" after twenty). Each trimmed result
+            # carries its own "atr saved" note instead, and the chat can add those up.
+            return ("This online server runs on many machines at once, so it keeps no running total. "
+                    "Each result ATR trimmed ends with a note like \"[atr saved 57,845 tokens (60,482→2,637)]\": "
+                    "add those up for this chat. (Run `atr hosted` yourself, or use ATR on your computer, "
+                    "to get a running total.)")
         text = super().stats_text()
         return text if self.cfg.servers else text.split("\n", 1)[0]
 

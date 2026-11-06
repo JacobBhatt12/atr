@@ -559,3 +559,34 @@ def test_hosted_search_tool(monkeypatch):
     assert not result["isError"] and "Page A | ex.com/a" in result["content"][0]["text"]
     assert len(result["content"][0]["text"]) < 400   # snippet shortened
     assert empty["isError"]
+
+
+def test_stats_never_show_a_loss_and_vercel_keeps_no_total(monkeypatch):
+    import atr.hosted as hosted
+
+    async def go():
+        srv = HostedServer()
+        await srv.start()
+        srv._count(76, 98)                        # ATR's note made a tiny result longer: counts as no change
+        local = (await srv.call("atr_stats", {}))["content"][0]["text"]
+        monkeypatch.setattr(hosted, "ON_VERCEL", True)
+        online = (await srv.call("atr_stats", {}))["content"][0]["text"]
+        await srv.close()
+        return srv.stats, local, online
+
+    stats, local, online = asyncio.run(go())
+    assert stats["results_after"] <= stats["results_before"]
+    assert "saved 0, 0%" in local and "-" not in local.split("(saved")[1].split(")")[0]
+    assert "no running total" in online and "tool results:" not in online   # not a per-machine count that looks like the total
+
+
+def test_big_savings_get_a_receipt_on_the_result(site, private_ok):
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_hosted()), base_url="http://atr") as c:
+            r = await c.post("/mcp", json=INIT)
+            h = {"mcp-session-id": r.headers["mcp-session-id"]}
+            res = await c.post("/mcp", json=rpc(2, "tools/call", {"name": "atr_fetch", "arguments": {
+                "url": site + "/article", "question": "what is the secret word?"}}), headers=h)
+            return res.json()["result"]["content"][0]["text"]
+    text = asyncio.run(go())
+    assert "[atr saved " in text and "→" in text.split("[atr saved ")[1]
