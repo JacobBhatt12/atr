@@ -3,6 +3,7 @@
     atr serve [--config PATH]           run the MCP server (what your AI client launches)
     atr serve --demo                    ... with a built-in fake 50-tool server, to try ATR out
     atr serve --http [--port 8789]      ... over HTTP, for ChatGPT / claude.ai connectors (needs .[http])
+    atr hosted [--port 7860]            the shared online connector for chatbots (needs .[hosted], see atr/hosted.py)
     atr compress FILE|- [--budget N]    shrink a file/paste before you paste it into any chat
                        [--copy]         ... and put the result on the clipboard
     atr init [--from CLIENT_CONFIG]     write ~/.atr/config.json (moving servers over from e.g.
@@ -73,6 +74,14 @@ def cmd_serve(a: argparse.Namespace) -> None:
     asyncio.run(serve(load_config(a)))
 
 
+def cmd_hosted(a: argparse.Namespace) -> None:
+    try:
+        from atr.hosted import run
+    except ImportError as e:
+        sys.exit(f"The hosted connector needs extra packages: pip install 'atr-mcp[hosted]'  ({e})")
+    run(a.host, a.port)
+
+
 def cmd_compress(a: argparse.Namespace) -> None:
     raw = sys.stdin.read() if a.file == "-" else Path(a.file).expanduser().read_text(errors="replace")
     r = compress(raw, budget=a.budget, level=a.level)
@@ -126,6 +135,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--allow-run", action="store_true", help="allow atr_run (shell commands) over HTTP")
     s.add_argument("--project", help="over HTTP: the only folder file/code tools may see")
     s.set_defaults(fn=cmd_serve)
+    h = sub.add_parser("hosted", help="run the shared online connector for chatbots (atr_fetch + personal links)")
+    h.add_argument("--host", default="0.0.0.0")
+    h.add_argument("--port", type=int, default=7860)
+    h.set_defaults(fn=cmd_hosted)
     c = sub.add_parser("compress", help="compress a file or stdin for pasting into a chat")
     c.add_argument("file", nargs="?", default="-")
     c.add_argument("--budget", type=int)

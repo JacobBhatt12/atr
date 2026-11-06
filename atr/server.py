@@ -25,9 +25,10 @@ from pathlib import Path
 from typing import Any
 
 from atr import __version__, code, tokens
-from atr.compress import compress, compress_output, head_tail
+from atr.compress import compress, compress_output, head_tail, html_to_text, looks_like_html, parse
 from atr.config import Config
 from atr.downstream import Downstream, log, make_downstream
+from atr.focus import focus, main_list, pick_items
 from atr.router import ToolIndex, signature, slim_schema, topics
 from atr.stash import Stash, query
 
@@ -70,14 +71,19 @@ INSTRUCTIONS = (
     "returns 'unchanged' or only the changed lines; pass fresh=true if you no longer have it. "
     "Tools from connected servers are hidden: atr_find_tools with a short task description, then atr_read "
     "for tools marked [r] (read-only) or atr_call for [w] (they change something and may need approval). "
+    "Add question= (what you need from the result) to get only the parts or list items that answer it. "
     "Large results come back summarized with a ref; use atr_query on the ref instead of calling the tool again. "
     "Browsers: to pull data out of a page, a page script (e.g. browser_evaluate returning just the titles) costs "
     "far less than a full snapshot; take snapshots when you need refs to click.")
+
+QUESTION_BUDGET = 400  # default tokens for a result read with question=
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 CALL_SCHEMA = {"type": "object", "properties": {
     "tool": {"type": "string"},
     "arguments": {"type": "object"},
+    "question": {"type": "string", "description": "What you need from the result. Only the matching parts "
+                 "(or list items) come back; the rest stays available through atr_query."},
     "budget": {"type": "integer", "description": "Max tokens for the result (default from config)."}},
     "required": ["tool"]}
 
@@ -190,6 +196,7 @@ class ATRServer:
         self.notify_client = None  # set by the stdio loop
         self.allow_read_files = True  # file + code reading; off by default over HTTP (atr/remote.py)
         self.allow_run = config.run   # atr_run; off by default over HTTP
+        self.instructions = INSTRUCTIONS
 
     # ------------------------------------------------------------ downstream servers
 
@@ -274,10 +281,56 @@ class ATRServer:
 
     # ------------------------------------------------------------ tool calls
 
-    def shrink(self, label: str, result: dict, budget: int | None) -> dict:
-        """Compress every text block of a downstream tool result; stash what had to be cut."""
+    def focus_text(self, raw: str, question: str, budget: int) -> tuple[str, str] | None:
+        """Only the parts of a result that answer `question`: (text, what was kept), or None when
+        the question doesn't narrow it down (then the result is compressed as usual)."""
+        value, is_data = parse(raw)
+        if is_data:
+            found = main_list(value)
+            idx = pick_items(found[0], question) if found else None
+            if not idx:
+                return None
+            items, path = found
+
+            def with_items(v: Any, keys: list, new: list) -> Any:
+                if not keys:
+                    return new
+                v = dict(v)
+                v[keys[0]] = with_items(v[keys[0]], keys[1:], new)
+                return v
+
+            def render(n: int) -> str:
+                return compress(with_items(value, path, [items[j] for j in sorted(idx[:n])]),
+                                level=self.cfg.level).text
+
+            lo, hi = 1, min(len(idx), 500)  # most matching items that fit the budget
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if tokens.count(render(mid)) <= budget:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            text = compress(with_items(value, path, [items[j] for j in sorted(idx[:lo])]),
+                            budget=budget, level=self.cfg.level).text
+            where = ".".join(map(str, path)) or "the list"
+            shown = f"all {lo}" if lo == len(idx) else f"the best {lo}"
+            return text, f"{len(idx)} of {len(items)} items in {where} match the question; showing {shown}"
+        text = html_to_text(value) if looks_like_html(value) else value
+        if tokens.count(text) <= budget:
+            return None
+        body, n, total = focus(text, question, budget=budget)
+        return body, f"{n} of {total} parts, the ones that best match the question"
+
+    def shrink(self, label: str, result: dict, budget: int | None, question: str | None = None) -> dict:
+        """Compress every text block of a downstream tool result; stash what had to be cut. With a
+        question, keep only the parts of each block that answer it."""
+        if question and not budget:
+            budget = min(self.cfg.budget, QUESTION_BUDGET)
         budget = budget or self.cfg.budget
-        content = list(result.get("content") or [])
+        # Embedded text resources (e.g. GitHub's file contents) are trimmed like text; binary ones pass through.
+        content = [{"type": "text", "text": f"[{c['resource'].get('uri', 'resource')}]\n{c['resource']['text']}"}
+                   if c.get("type") == "resource" and isinstance((c.get("resource") or {}).get("text"), str) else c
+                   for c in (result.get("content") or [])]
         texts = [c for c in content if c.get("type") == "text"]
         if not texts and result.get("structuredContent") is not None:
             texts = [{"type": "text", "text": json.dumps(result["structuredContent"])}]
@@ -287,6 +340,16 @@ class ATRServer:
         for c in content:
             if c.get("type") != "text":
                 out.append(c)  # images, audio, resource links pass through
+                continue
+            focused = self.focus_text(c.get("text", ""), question, per) if question else None
+            if focused:
+                ref = self.stash.put(label, c.get("text", ""))
+                self.stats["stashed"] += 1
+                text = (f"{focused[0]}\n[atr: {focused[1]}. Full result is {ref}: "
+                        f"atr_query(ref=\"{ref}\", search=…, path=…, where=[…]) for anything else]")
+                before += tokens.count(c.get("text", ""))
+                after += tokens.count(text)
+                out.append({"type": "text", "text": text})
                 continue
             r = compress(c.get("text", ""), budget=per, level=self.cfg.level)
             text = r.text
@@ -305,7 +368,8 @@ class ATRServer:
         self.stats["calls"] += 1
         return {"content": out, "isError": bool(result.get("isError"))}
 
-    async def call_downstream(self, name: str, args: dict, budget: int | None = None) -> dict:
+    async def call_downstream(self, name: str, args: dict, budget: int | None = None,
+                              question: str | None = None) -> dict:
         await self.ready.wait()
         if name not in self.tools:
             hits = self.index.search(name.replace(SEP, " "), 3)
@@ -319,7 +383,7 @@ class ATRServer:
             res = await d.call_tool(t["name"], args)
         except Exception as e:  # noqa: BLE001
             return text_result(f"{name} failed: {e}", True)
-        return self.shrink(name, res, budget)
+        return self.shrink(name, res, budget, question)
 
     async def find_tools(self, q: str, k: int | None, detail: bool) -> dict:
         await self.ready.wait()
@@ -532,6 +596,7 @@ class ATRServer:
             return await self.find_tools(a.get("query", ""), a.get("k"), bool(a.get("detail")))
         if name in ("atr_read", "atr_call"):
             tool = a.get("tool", "")
+            await self.ready.wait()  # the tool list must be loaded before checking read-only
             if name == "atr_read" and tool in self.tools and not self.is_read_only(tool):
                 return text_result(f"{tool} can change things, so it isn't allowed through atr_read. "
                                    f"Use atr_call (the user may be asked to approve it).", True)
@@ -541,7 +606,7 @@ class ATRServer:
                     args = json.loads(args)
                 except ValueError:
                     return text_result("arguments must be an object, e.g. {\"url\": \"https://…\"}", True)
-            return await self.call_downstream(tool, args, a.get("budget"))
+            return await self.call_downstream(tool, args, a.get("budget"), a.get("question") or None)
         if name == "atr_query":
             return self.query_ref(a)
         if name in FILE_TOOLS and not self.allow_read_files:
@@ -569,7 +634,7 @@ class ATRServer:
                           "capabilities": {"tools": {"listChanged": True}},
                           "serverInfo": {"name": "atr", "title": "ATR: Automation for Token Reduction",
                                          "version": __version__},
-                          "instructions": INSTRUCTIONS}
+                          "instructions": self.instructions}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":

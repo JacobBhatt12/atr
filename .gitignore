@@ -17,3 +17,6 @@ LAUNCH-CHECKLIST.md
 # local tool output and dev config
 .playwright-mcp/
 gen-context.config.json
+
+# Vercel deploy staging (deploy/vercel/deploy.py)
+deploy/vercel/.build/

@@ -236,3 +236,45 @@ def test_core_tools_always_load_and_search_names_the_rest():
         bare = ATRServer(Config())
         assert all("_meta" not in t for t in bare.list_tools())  # nothing behind ATR: nothing forced into the prompt
     run(go())
+
+
+def test_question_keeps_only_the_matching_parts():
+    async def go():
+        srv = ATRServer(Config(servers=FAKE, budget=1500))
+        await srv.start()
+        try:
+            res = await srv.call("atr_read", {"tool": "fake__github_list_issues", "arguments": {},
+                                              "question": "which issues are about a memory leak?"})
+            text = res["content"][0]["text"]
+            assert "memory leak" in text and "crash on login" not in text and "slow dashboard" not in text
+            assert "items in the list match the question" in text and tokens.count(text) < 700
+            ref = text.rsplit("Full result is ", 1)[1].split(":", 1)[0]
+            q = await srv.call("atr_query", {"ref": ref, "where": ["number=42"], "fields": ["title"]})
+            assert "Bug 42" in q["content"][0]["text"]  # nothing lost
+
+            res = await srv.call("atr_read", {"tool": "fake__logs_tail_logs", "arguments": {},
+                                              "question": "why did the request fail? connection reset"})
+            text = res["content"][0]["text"]
+            assert "ConnectionResetError" in text and "parts" in text and tokens.count(text) < 700
+
+            # a question that matches everything doesn't narrow anything: the usual compressed result
+            res = await srv.call("atr_read", {"tool": "fake__github_list_issues", "arguments": {}, "question": "bug"})
+            assert "match the question" not in res["content"][0]["text"]
+        finally:
+            await srv.close()
+    run(go())
+
+
+def test_embedded_text_resources_are_trimmed_like_text():
+    # GitHub's MCP returns file contents as an embedded resource, not a text block
+    srv = ATRServer(Config(servers={}, budget=1500))
+    doc = "\n\n".join(f"## Section {i}\n" + f"Filler sentence number {i} about nothing much. " * 40 for i in range(30))
+    doc += "\n\n## Installation\nRun pip install widget to install it. Needs Python 3.11 or newer."
+    result = {"content": [{"type": "text", "text": "downloaded file"},
+                          {"type": "resource", "resource": {"uri": "repo://README.md", "text": doc}},
+                          {"type": "resource", "resource": {"uri": "repo://logo.png", "blob": "AAAA"}}]}
+    out = srv.shrink("github__get_file_contents", result, None, question="how do I install it?")
+    texts = [c["text"] for c in out["content"] if c.get("type") == "text"]
+    assert any("pip install widget" in t for t in texts)
+    assert sum(tokens.count(t) for t in texts) < 800 < tokens.count(doc)
+    assert {"type": "resource", "resource": {"uri": "repo://logo.png", "blob": "AAAA"}} in out["content"]  # binary passes through
